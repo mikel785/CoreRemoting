@@ -350,6 +350,71 @@ namespace CoreRemoting.Tests
             
             Assert.Equal("Yay", result);
         }
+
+        [Fact]
+        public void Implemented_method_should_be_called_correctly()
+        {
+            bool remoteServiceCalled = false;
+
+            var testService =
+                new TestService()
+                {
+                    BaseTestMethodFake = arg =>
+                    {
+                        remoteServiceCalled = true;
+                        return arg;
+                    }
+                };
+            
+            var serverConfig =
+                new ServerConfig()
+                {
+                    MessageEncryption = false,
+                    NetworkPort = 9094,
+                    RegisterServicesAction = container =>
+                        container.RegisterService<ITestService>(
+                            factoryDelegate: () => testService,
+                            lifetime: ServiceLifetime.Singleton)
+                };
+
+            int serverErrorCount = 0;
+            
+            using var server = new RemotingServer(serverConfig);
+            server.Error += (_, _) => serverErrorCount++;
+            server.Start();
+
+            void ClientAction()
+            {
+                try
+                {
+                    using var client = new RemotingClient(new ClientConfig()
+                    {
+                        ConnectionTimeout = 0, 
+                        ServerPort = 9094,
+                        MessageEncryption = false
+                    });
+
+                    client.Connect();
+
+                    var proxy = client.CreateProxy<ITestService>();
+                    var result = proxy.BaseTestMethod("test");
+
+                    Assert.Equal("test", result);
+                }
+                catch (Exception e)
+                {
+                    _testOutputHelper.WriteLine(e.ToString());
+                    throw;
+                }
+            }
+
+            var clientThread = new Thread(ClientAction);
+            clientThread.Start();
+            clientThread.Join();
+            
+            Assert.True(remoteServiceCalled);
+            Assert.Equal(0, serverErrorCount);
+        }
         
         #region Service with enum as operation argument
 

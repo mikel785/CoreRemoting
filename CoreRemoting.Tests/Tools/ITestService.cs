@@ -3,7 +3,7 @@ using CoreRemoting.Tests.ExternalTypes;
 
 namespace CoreRemoting.Tests.Tools
 {
-    public interface ITestService
+    public interface ITestService : IBaseTestService
     {
         event Action ServiceEvent;
         

@@ -426,7 +426,15 @@ namespace CoreRemoting
                 method =
                     serviceInterfaceType.GetMethod(
                         name: callMessage.MethodName,
-                        types: parameterTypes);    
+                        types: parameterTypes);
+
+                if (method == null)
+                {
+                    var serviceImplementedInterfaces = serviceInterfaceType.GetInterfaces();
+                    method = serviceImplementedInterfaces
+                        .Select(x => x.GetMethod(callMessage.MethodName, parameterTypes))
+                        .FirstOrDefault();
+                }
             }
 
             if (method == null)
