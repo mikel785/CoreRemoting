@@ -6,6 +6,8 @@ namespace CoreRemoting.Tests.Tools
     public class TestService : ITestService
     {
         public Func<object, object> TestMethodFake { get; set; }
+        
+        public Func<object, object> BaseTestMethodFake { get; set; }
 
         public Action OneWayMethodFake { get; set; }
         
@@ -41,6 +43,11 @@ namespace CoreRemoting.Tests.Tools
         public string Echo(string text)
         {
             return text;
+        }
+
+        public object BaseTestMethod(object arg)
+        {
+            return BaseTestMethodFake?.Invoke(arg);
         }
     }
 }
