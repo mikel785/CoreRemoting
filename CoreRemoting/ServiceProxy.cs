@@ -155,10 +155,7 @@ namespace CoreRemoting
 
             // Create a proxy to remote service, if return type is a service reference  
             if (returnValue is ServiceReference serviceReference)
-            {
-                var serviceInterfaceType = Type.GetType(serviceReference.ServiceInterfaceTypeName);
-                returnValue = _client.CreateProxy(serviceInterfaceType, serviceReference.ServiceName);
-            }
+                returnValue = _client.CreateProxy(serviceReference);
 
             invocation.ReturnValue = returnValue;
                 
@@ -237,13 +234,13 @@ namespace CoreRemoting
 
             var delegateReturnType = argumentType.GetMethod("Invoke")?.ReturnType;
 
-            if (delegateReturnType != typeof(void))
+            if (delegateReturnType != null && delegateReturnType != typeof(void))
                 throw new NotSupportedException("Only void delegates are supported.");
 
             var remoteDelegateInfo =
                 new RemoteDelegateInfo(
                     handlerKey: _client.ClientDelegateRegistry.RegisterClientDelegate((Delegate)argument, this),
-                    delegateTypeName: argumentType.FullName);
+                    delegateTypeName: argumentType.FullName + ", " + argumentType.Assembly.GetName().Name);
 
             mappedArgument = remoteDelegateInfo;
             return true;

@@ -1,4 +1,6 @@
 using System;
+using System.Net.Sockets;
+using System.Reflection;
 using WebSocketSharp;
 using WebSocketSharp.Net;
 
@@ -20,7 +22,10 @@ namespace CoreRemoting.Channels.Websocket
         /// Event: Fires when an error is occurred.
         /// </summary>
         public event Action<string, Exception> ErrorOccured;
-        
+
+        /// <inheritdoc />
+        public event Action Disconnected;
+
         /// <summary>
         /// Initializes the channel.
         /// </summary>
@@ -35,6 +40,8 @@ namespace CoreRemoting.Channels.Websocket
             
             _webSocket = new WebSocket(url);
 
+            TryToSetNoDelayFlagOnUnderlyingTcpClient();
+            
             _webSocket.SetCookie(new Cookie(
                 name: "MessageEncryption",
                 value: client.MessageEncryption ? "1" : "0"));
@@ -51,6 +58,24 @@ namespace CoreRemoting.Channels.Websocket
         }
 
         /// <summary>
+        /// Try to set NoDelay flag on the underlying TcpClient to enhance performance on Linux.
+        /// </summary>
+        private void TryToSetNoDelayFlagOnUnderlyingTcpClient()
+        {
+            var webSocketType = _webSocket.GetType();
+            var tcpClientPrivateField =
+                webSocketType.GetField(
+                    name: "_tcpClient",
+                    bindingAttr: BindingFlags.NonPublic | BindingFlags.GetField);
+
+            if (tcpClientPrivateField != null)
+            {
+                if (tcpClientPrivateField.GetValue(_webSocket) is TcpClient tcpClient)
+                    tcpClient.NoDelay = true;
+            }
+        }
+        
+        /// <summary>
         /// Establish a websocket connection with the server.
         /// </summary>
         public void Connect()
@@ -65,16 +90,22 @@ namespace CoreRemoting.Channels.Websocket
             
             _webSocket.OnMessage += OnMessage;
             _webSocket.OnError += OnError;
+            _webSocket.OnClose += OnDisconnected;
 
             _webSocket.Connect();
             _webSocket.Send(string.Empty);
         }
 
+        private void OnDisconnected(object o, CloseEventArgs closeEventArgs)
+        {
+            Disconnected?.Invoke();
+        }
+
         /// <summary>
         /// Event procedure: Called when a error occurs on the websocket layer.
         /// </summary>
-        /// <param name="sender"></param>
-        /// <param name="e"></param>
+        /// <param name="sender">Event sender</param>
+        /// <param name="e">Event arguments</param>
         private void OnError(object sender, ErrorEventArgs e)
         {
             LastException = new NetworkException(e.Message, e.Exception);

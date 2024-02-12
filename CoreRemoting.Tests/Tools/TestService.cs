@@ -5,7 +5,7 @@ namespace CoreRemoting.Tests.Tools
 {
     public class TestService : ITestService
     {
-        private int _counter = 0;
+        private int _counter;
         
         public Func<object, object> TestMethodFake { get; set; }
 
@@ -14,6 +14,8 @@ namespace CoreRemoting.Tests.Tools
         public Action<DataClass> TestExternalTypeParameterFake { get; set; }
         
         public event Action ServiceEvent; 
+        
+        public event ServerEventHandler CustomDelegateEvent;
         
         public object TestMethod(object arg)
         {
@@ -29,7 +31,12 @@ namespace CoreRemoting.Tests.Tools
         {
             ServiceEvent?.Invoke();
         }
-        
+
+        public void FireCustomDelegateEvent()
+        {
+            CustomDelegateEvent?.Invoke(null);
+        }
+
         public void OneWayMethod()
         {
             OneWayMethodFake?.Invoke();
@@ -49,6 +56,11 @@ namespace CoreRemoting.Tests.Tools
         {
             _counter++;
             counter = _counter;
+        }
+
+        public bool BaseMethod()
+        {
+            return true;
         }
     }
 }

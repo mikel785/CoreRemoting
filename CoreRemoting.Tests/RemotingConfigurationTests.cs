@@ -11,12 +11,17 @@ using Xunit;
 
 namespace CoreRemoting.Tests
 {
-    public class RemotingConfigurationTests
-    {
+    public class RemotingConfigurationTests : IClassFixture<ServerFixture>
+    {   
         [Fact]
         public void RegisterWellKnownServiceType_should_register_type_resolved_at_runtime()
         {
-            using var server = new RemotingServer(new ServerConfig { UniqueServerInstanceName = "Server1" });
+            RemotingConfiguration.RegisterServer(new ServerConfig()
+            {
+                UniqueServerInstanceName = "Server1"
+            });
+
+            var server = RemotingConfiguration.GetRegisteredServer("Server1");
             
             RemotingConfiguration.RegisterWellKnownServiceType(
                 interfaceType: typeof(ITestService),
@@ -25,7 +30,7 @@ namespace CoreRemoting.Tests
                 serviceName: "Service1",
                 uniqueServerInstanceName: "Server1");
 
-            var service = server.ServiceRegistry.GetService("Service1");
+            var service =  server.ServiceRegistry.GetService("Service1");
             
             Assert.NotNull(service);
             Assert.Equal(typeof(TestService), service.GetType());
@@ -36,16 +41,18 @@ namespace CoreRemoting.Tests
         [Fact]
         public void RemotingServer_should_register_on_construction_AND_unregister_on_Dispose()
         {
-            using var server = new RemotingServer(new ServerConfig()
+            RemotingConfiguration.RegisterServer(new ServerConfig()
             {
-                UniqueServerInstanceName = "TestServer"
+                UniqueServerInstanceName = "Server1"
             });
             
-            Assert.NotNull(RemotingConfiguration.GetRegisteredServer("TestServer"));
+            Assert.NotNull(RemotingConfiguration.GetRegisteredServer("Server1"));
+            
+            var server = RemotingConfiguration.GetRegisteredServer("Server1");
             
             server.Dispose();
             
-            Assert.Null(RemotingConfiguration.GetRegisteredServer("TestServer"));
+            Assert.Null(RemotingConfiguration.GetRegisteredServer("Server1"));
         }
 
         [Fact]

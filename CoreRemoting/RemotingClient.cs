@@ -11,7 +11,7 @@ using System.Timers;
 using Castle.DynamicProxy;
 using CoreRemoting.Authentication;
 using CoreRemoting.Channels;
-using CoreRemoting.Channels.Websocket;
+using CoreRemoting.Channels.Tcp;
 using CoreRemoting.RpcMessaging;
 using CoreRemoting.RemoteDelegates;
 using CoreRemoting.Encryption;
@@ -48,6 +48,11 @@ namespace CoreRemoting
             new ConcurrentDictionary<string, IRemotingClient>();
         
         private static WeakReference<IRemotingClient> _defaultRemotingClientRef;
+
+        /// <summary>
+        /// Event: Fires after client was disconnected.
+        /// </summary>
+        public event Action AfterDisconnect;
         
         #endregion
         
@@ -82,9 +87,10 @@ namespace CoreRemoting
             if (MessageEncryption)
                 _keyPair = new RsaKeyPair(config.KeySize);
             
-            _channel = config.Channel ?? new WebsocketClientChannel();
+            _channel = config.Channel ?? new TcpClientChannel();
             
             _channel.Init(this);
+            _channel.Disconnected += OnDisconnected;
             _rawMessageTransport = _channel.RawMessageTransport;
             _rawMessageTransport.ReceiveMessage += OnMessage;
             _rawMessageTransport.ErrorOccured += (s, exception) =>
@@ -97,8 +103,8 @@ namespace CoreRemoting
 
             _clientInstances.AddOrUpdate(
                 key: config.UniqueClientInstanceName,
-                addValueFactory: uniqueInstanceName => this,
-                updateValueFactory: (uniqueInstanceName, oldClient) =>
+                addValueFactory: _ => this,
+                updateValueFactory: (_, oldClient) =>
                 {
                     oldClient?.Dispose();
                     return this;
@@ -108,6 +114,16 @@ namespace CoreRemoting
                 return;
             
             RemotingClient.DefaultRemotingClient ??= this;
+        }
+
+        private void OnDisconnected()
+        {
+            foreach (var activeCall in _activeCalls)
+            {
+                activeCall.Value.Error = true;
+                activeCall.Value.RemoteException = new RemoteInvocationException("Server Disconnected");
+                activeCall.Value.WaitHandle.Set();
+            }
         }
 
         #endregion
@@ -157,7 +173,7 @@ namespace CoreRemoting
         /// <summary>
         /// Gets the public key of this CoreRemoting client instance.
         /// </summary>
-        public byte[] PublicKey => _keyPair.PublicKey;
+        public byte[] PublicKey => _keyPair?.PublicKey;
 
         /// <summary>
         /// Gets whether the connection to the server is established or not.
@@ -210,7 +226,8 @@ namespace CoreRemoting
         /// <summary>
         /// Disconnects from the server. The server is actively notified about disconnection.
         /// </summary>
-        public void Disconnect()
+        /// <param name="quiet">When set to true, no goodbye message is sent to the server</param>
+        public void Disconnect(bool quiet = false)
         {
             if (_channel != null && HasSession)
             {
@@ -226,33 +243,39 @@ namespace CoreRemoting
                         ? _sessionId.ToByteArray()
                         : null;
 
-                var goodbyeMessage =
-                    new GoodbyeMessage()
-                    {
-                        SessionId = _sessionId
-                    };
+                if (!quiet)
+                {
+                    var goodbyeMessage =
+                        new GoodbyeMessage()
+                        {
+                            SessionId = _sessionId
+                        };
 
-                var wireMessage =
-                    MessageEncryptionManager.CreateWireMessage(
-                        messageType: "goodbye",
-                        serializer: Serializer,
-                        serializedMessage: Serializer.Serialize(goodbyeMessage),
-                        keyPair: _keyPair,
-                        sharedSecret: sharedSecret);
+                    var wireMessage =
+                        MessageEncryptionManager.CreateWireMessage(
+                            messageType: "goodbye",
+                            serializer: Serializer,
+                            serializedMessage: Serializer.Serialize(goodbyeMessage),
+                            keyPair: _keyPair,
+                            sharedSecret: sharedSecret);
 
-                byte[] rawData = Serializer.Serialize(wireMessage);
+                    byte[] rawData = Serializer.Serialize(wireMessage);
+
+                    _goodbyeCompletedWaitHandle.Reset();
+
+                    _channel.RawMessageTransport.SendMessage(rawData);
                 
-                _goodbyeCompletedWaitHandle.Reset();
-                
-                _channel.RawMessageTransport.SendMessage(rawData);
-
-                _goodbyeCompletedWaitHandle.Wait(10000);
+                    _goodbyeCompletedWaitHandle.Wait(10000);
+                }
             }
 
             _channel?.Disconnect();
             _handshakeCompletedWaitHandle?.Reset();
             _authenticationCompletedWaitHandle?.Reset();
             Identity = null;
+            _sessionId = Guid.Empty;
+            
+            AfterDisconnect?.Invoke();
         }
 
         /// <summary>
@@ -356,26 +379,32 @@ namespace CoreRemoting
         /// <param name="rawMessage">Raw message data</param>
         private void OnMessage(byte[] rawMessage)
         {
-            var message = Serializer.Deserialize<WireMessage>(rawMessage);
-            
-            switch (message.MessageType.ToLower())
+            Task.Run(() =>
             {
-                case "complete_handshake":
-                    ProcessCompleteHandshakeMessage(message);
-                    break;
-                case "auth_response":
-                    ProcessAuthenticationResponseMessage(message);
-                    break;
-                case "rpc_result":
-                    ProcessRpcResultMessage(message);
-                    break;
-                case "invoke":
-                    ProcessRemoteDelegateInvocationMessage(message);
-                    break;
-                case "goodbye":
-                    _goodbyeCompletedWaitHandle.Set();
-                    break;
-            }
+                var message = Serializer.Deserialize<WireMessage>(rawMessage);
+
+                switch (message.MessageType.ToLower())
+                {
+                    case "complete_handshake":
+                        ProcessCompleteHandshakeMessage(message);
+                        break;
+                    case "auth_response":
+                        ProcessAuthenticationResponseMessage(message);
+                        break;
+                    case "rpc_result":
+                        ProcessRpcResultMessage(message);
+                        break;
+                    case "invoke":
+                        ProcessRemoteDelegateInvocationMessage(message);
+                        break;
+                    case "goodbye":
+                        _goodbyeCompletedWaitHandle.Set();
+                        break;
+                    case "session_closed":
+                        Disconnect(quiet: true);
+                        break;
+                }
+            });
         }
 
         /// <summary>
@@ -488,7 +517,7 @@ namespace CoreRemoting
                     ? Guid.Empty 
                     : new Guid(message.UniqueCallKey);
             
-            if (!_activeCalls.TryGetValue(unqiueCallKey, out ClientRpcContext clientRpcContext))
+            if (!_activeCalls.TryRemove(unqiueCallKey, out ClientRpcContext clientRpcContext))
                 throw new KeyNotFoundException("Received a result for a unknown call.");
             
             clientRpcContext.Error = message.Error;
@@ -546,7 +575,7 @@ namespace CoreRemoting
         internal Task<ClientRpcContext> InvokeRemoteMethod(MethodCallMessage methodCallMessage, bool oneWay = false)
         {
             var sendTask =
-                new Task<ClientRpcContext>(() =>
+                Task.Run(() =>
                 {
                     byte[] sharedSecret =
                         MessageEncryption
@@ -587,8 +616,6 @@ namespace CoreRemoting
                     return clientRpcContext;
                 });
 
-            sendTask.Start();
-            
             return sendTask;
         }
         
@@ -625,6 +652,17 @@ namespace CoreRemoting
             return ProxyGenerator.CreateInterfaceProxyWithoutTarget(
                 interfaceToProxy: serviceInterfaceType,
                 interceptor: (IInterceptor)serviceProxy);
+        }
+
+        /// <summary>
+        /// Creates a proxy object to provide access to a remote service.
+        /// </summary>
+        /// <param name="serviceReference">Reference to remote service registration (This is not an object reference!)</param>
+        /// <returns>Proxy object</returns>
+        public object CreateProxy(ServiceReference serviceReference)
+        {
+            var serviceInterfaceType = Type.GetType(serviceReference.ServiceInterfaceTypeName);
+            return CreateProxy(serviceInterfaceType, serviceReference.ServiceName);
         }
 
         /// <summary>

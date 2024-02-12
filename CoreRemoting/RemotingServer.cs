@@ -4,7 +4,7 @@ using System.Collections.Generic;
 using System.Diagnostics.CodeAnalysis;
 using CoreRemoting.Authentication;
 using CoreRemoting.Channels;
-using CoreRemoting.Channels.Websocket;
+using CoreRemoting.Channels.Tcp;
 using CoreRemoting.DependencyInjection;
 using CoreRemoting.RpcMessaging;
 using CoreRemoting.RemoteDelegates;
@@ -44,8 +44,8 @@ namespace CoreRemoting
             
             _serverInstances.AddOrUpdate(
                 key: _config.UniqueServerInstanceName,
-                addValueFactory: uniqueInstanceName => this,
-                updateValueFactory: (uniqueInstanceName, oldServer) =>
+                addValueFactory: _ => this,
+                updateValueFactory: (_, oldServer) =>
                 {
                     oldServer?.Dispose();
                     return this;
@@ -68,7 +68,7 @@ namespace CoreRemoting
             
             _config.RegisterServicesAction?.Invoke(_container);
 
-            Channel = _config.Channel ?? new WebsocketServerChannel();
+            Channel = _config.Channel ?? new TcpServerChannel();
             
             Channel.Init(this);
             
