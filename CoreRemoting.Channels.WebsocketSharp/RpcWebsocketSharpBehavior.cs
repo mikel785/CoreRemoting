@@ -1,8 +1,9 @@
 using System;
+using System.Threading.Tasks;
 using WebSocketSharp;
 using WebSocketSharp.Server;
 
-namespace CoreRemoting.Channels.Websocket
+namespace CoreRemoting.Channels.WebsocketSharp
 {
     /// <summary>
     /// Executes RPC calls from clients.
@@ -11,17 +12,17 @@ namespace CoreRemoting.Channels.Websocket
     {
         private IRemotingServer _server;
         private RemotingSession _session;
-        
+
         /// <summary>
         /// Event: Fired when a message is received via websocket.
         /// </summary>
         public event Action<byte[]> ReceiveMessage;
-        
+
         /// <summary>
         /// Event: Fires when an error is occurred.
         /// </summary>
         public event Action<string, Exception> ErrorOccured;
-        
+
         /// <summary>
         /// Initializes the RPC service instance.
         /// </summary>
@@ -35,12 +36,12 @@ namespace CoreRemoting.Channels.Websocket
         /// Sends a message over the websocket.
         /// </summary>
         /// <param name="rawMessage">Raw data of the message</param>
-        public bool SendMessage(byte[] rawMessage)
+        public Task<bool> SendMessageAsync(byte[] rawMessage)
         {
             Send(rawMessage);
-            return true;
+            return Task.FromResult(true);
         }
-        
+
         /// <summary>
         /// Called when a message from a client is received.
         /// </summary>
@@ -50,7 +51,7 @@ namespace CoreRemoting.Channels.Websocket
             if (_session == null)
             {
                 byte[] clientPublicKey = null;
-            
+
                 var messageEncryptionCookie = Context.CookieCollection["MessageEncryption"];
 
                 if (messageEncryptionCookie?.Value == "1")
@@ -61,13 +62,14 @@ namespace CoreRemoting.Channels.Websocket
                         Convert.FromBase64String(
                             shakeHandsCookie.Value);
                 }
-            
-                _session = 
+
+                _session =
                     _server.SessionRepository.CreateSession(
                         clientPublicKey,
+                        Context.UserEndPoint.ToString(),
                         _server,
                         this);
-                
+
                 _session.BeforeDispose += BeforeDisposeSession;
             }
             else
@@ -90,7 +92,7 @@ namespace CoreRemoting.Channels.Websocket
         protected override void OnError(ErrorEventArgs e)
         {
             LastException = new NetworkException(e.Message, e.Exception);
-            
+
             ErrorOccured?.Invoke(e.Message, e.Exception);
         }
 

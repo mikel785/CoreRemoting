@@ -1,5 +1,7 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using CoreRemoting.Toolbox;
 using WatsonTcp;
 
 namespace CoreRemoting.Channels.Tcp;
@@ -16,7 +18,7 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     /// Event: Fires when a message is received from server.
     /// </summary>
     public event Action<byte[]> ReceiveMessage;
-        
+
     /// <summary>
     /// Event: Fires when an error is occurred.
     /// </summary>
@@ -34,7 +36,7 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
         _tcpClient = new WatsonTcpClient(client.Config.ServerHostName, client.Config.ServerPort);
         _tcpClient.Settings.NoDelay = true;
 
-        _handshakeMetadata = 
+        _handshakeMetadata =
             new Dictionary<string, object>
             {
                 { "MessageEncryption", client.MessageEncryption }
@@ -47,19 +49,21 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     /// <summary>
     /// Establish a connection with the server.
     /// </summary>
-    public void Connect()
+    public Task ConnectAsync()
     {
         if (_tcpClient == null)
             throw new InvalidOperationException("Channel is not initialized.");
-            
+
         if (_tcpClient.Connected)
-            return;
+            return Task.CompletedTask;
 
         _tcpClient.Events.ExceptionEncountered += OnError;
         _tcpClient.Events.MessageReceived += OnMessage;
         _tcpClient.Events.ServerDisconnected += OnDisconnected;
         _tcpClient.Connect();
+        return Task.CompletedTask;
     }
+
     private void OnDisconnected(object o, DisconnectionEventArgs disconnectionEventArgs)
     {
         Disconnected?.Invoke();
@@ -73,7 +77,7 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     private void OnError(object sender, ExceptionEventArgs e)
     {
         LastException = new NetworkException(e.Exception.Message, e.Exception);
-            
+
         ErrorOccured?.Invoke(e.Exception.Message, e.Exception);
     }
 
@@ -86,7 +90,7 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     {
         if (e.Metadata != null && e.Metadata.ContainsKey("ServerAcceptConnection"))
         {
-            if (!_tcpClient.Send(new byte[1] { 0x0 }, _handshakeMetadata) && !_tcpClient.Connected)
+            if (!_tcpClient.SendAsync(new byte[] { 0x0 }, _handshakeMetadata).Result && !_tcpClient.Connected)
                 _tcpClient = null;
         }
         else
@@ -98,10 +102,10 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     /// <summary>
     /// Closes the connection.
     /// </summary>
-    public void Disconnect()
+    public Task DisconnectAsync()
     {
         if (_tcpClient == null)
-            return;
+            return Task.CompletedTask;
 
         _tcpClient.Events.MessageReceived -= OnMessage;
         _tcpClient.Events.ExceptionEncountered -= OnError;
@@ -120,6 +124,7 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
 
         _tcpClient.Dispose();
         _tcpClient = null;
+        return Task.CompletedTask;
     }
 
     /// <summary>
@@ -131,16 +136,16 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
     /// Gets the raw message transport component for this connection.
     /// </summary>
     public IRawMessageTransport RawMessageTransport => this;
-    
+
     /// <summary>
     /// Sends a message to the server.
     /// </summary>
     /// <param name="rawMessage">Raw message data</param>
-    public bool SendMessage(byte[] rawMessage)
+    public async Task<bool> SendMessageAsync(byte[] rawMessage)
     {
         if (_tcpClient != null)
         {
-            if (_tcpClient.Send(rawMessage))
+            if (await _tcpClient.SendAsync(rawMessage).ConfigureAwait(false))
                 return true;
             if (!_tcpClient.Connected)
                 _tcpClient = null;
@@ -149,17 +154,17 @@ public class TcpClientChannel : IClientChannel, IRawMessageTransport
         else
             throw new NetworkException("Channel disconnected");
     }
-    
+
     /// <summary>
     /// Gets or sets the last exception.
     /// </summary>
     public NetworkException LastException { get; set; }
-    
+
     /// <summary>
     /// Disconnect and free manages resources.
     /// </summary>
     public void Dispose()
     {
-        Disconnect();
+        DisconnectAsync().JustWait();
     }
 }

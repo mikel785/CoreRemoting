@@ -1,89 +1,93 @@
 using System;
-using System.Net.Sockets;
-using System.Reflection;
-using WebSocketSharp.Server;
+using System.Collections.Concurrent;
+using System.Net;
+using System.Threading.Tasks;
 
-namespace CoreRemoting.Channels.Websocket
+namespace CoreRemoting.Channels.Websocket;
+
+/// <summary>
+/// Server side websocket channel implementation based on System.Net.Websockets and HttpListener.
+/// </summary>
+public class WebsocketServerChannel : IServerChannel
 {
-    /// <summary>
-    /// Server side websocket channel implementation.
-    /// </summary>
-    public class WebsocketServerChannel : IServerChannel
+    private HttpListener HttpListener { get; set; }
+
+    private IRemotingServer Server { get; set; }
+
+    private ConcurrentDictionary<Guid, WebsocketServerConnection> Connections { get; } = new();
+
+    /// <inheritdoc/>
+    public bool IsListening => HttpListener.IsListening;
+
+    /// <inheritdoc/>
+    public void Init(IRemotingServer server)
     {
-        private WebSocketServer _webSocketServer;
-        private IRemotingServer _server;
+        if (!HttpListener.IsSupported)
+            throw new NotSupportedException("HttpListener not supported by this platform.");
 
-        /// <summary>
-        /// Initializes the channel.
-        /// </summary>
-        /// <param name="server">CoreRemoting sever</param>
-        public void Init(IRemotingServer server)
+        Server = server ?? throw new ArgumentNullException(nameof(server));
+        HttpListener = new();
+
+        var prefix = "http://" +
+            Server.Config.HostName + ":" +
+            Server.Config.NetworkPort + "/";
+
+        HttpListener.Prefixes.Add(prefix);
+    }
+
+    /// <inheritdoc/>
+    public void StartListening()
+    {
+        HttpListener.Start();
+
+        _ = Task.Factory.StartNew(async () =>
         {
-            _server = server ?? throw new ArgumentNullException(nameof(server));
-            
-            _webSocketServer = new WebSocketServer(_server.Config.NetworkPort, secure: false);
+            while (IsListening)
+                await ReceiveConnection();
+        });
+    }
 
-            TryToSetNoDelayFlagOnUnderlyingTcpListener();
+    private async Task ReceiveConnection()
+    {
+        // check if it's a websocket request
+        var context = await HttpListener.GetContextAsync()
+            .ConfigureAwait(false);
 
-            _webSocketServer.AddWebSocketService(
-                path: "/rpc",
-                initializer: () => new RpcWebsocketSharpBehavior(_server));
+        if (!context.Request.IsWebSocketRequest)
+        {
+            context.Response.StatusCode = (int)HttpStatusCode.BadRequest;
+            context.Response.Close();
+            return;
         }
 
-        /// <summary>
-        /// Try to set NoDelay flag on the underlying TcpListener to enhance performance on Linux.
-        /// </summary>
-        private void TryToSetNoDelayFlagOnUnderlyingTcpListener()
-        {
-            var webSocketServerType = _webSocketServer.GetType();
-            var listenerPrivateField =
-                webSocketServerType.GetField(
-                    name: "_listener",
-                    bindingAttr: BindingFlags.NonPublic | BindingFlags.GetField);
+        // accept websocket request and start a new session
+        var websocketContext = await context.AcceptWebSocketAsync(null)
+            .ConfigureAwait(false);
 
-            if (listenerPrivateField != null)
-            {
-                if (listenerPrivateField.GetValue(_webSocketServer) is TcpListener tcpListener)
-                    tcpListener.Server.NoDelay = true;
-            }
-        }
+        var websocket = websocketContext.WebSocket;
+        var connection = new WebsocketServerConnection(
+            context.Request.RemoteEndPoint.ToString(),
+            websocketContext, websocket, Server);
 
-        /// <summary>
-        /// Start listening for client requests.
-        /// </summary>
-        public void StartListening()
-        {
-            if (_webSocketServer == null)
-                throw new InvalidOperationException("Channel is not initialized.");
-            
-            _webSocketServer.Start();
-        }
+        // handle incoming websocket messages
+        var sessionId = connection.StartListening();
+        Connections[sessionId] = connection;
+    }
 
-        /// <summary>
-        /// Stop listening for client requests.
-        /// </summary>
-        public void StopListening()
-        {
-            if (_webSocketServer == null)
-                throw new InvalidOperationException("Channel is not initialized.");
-            
-            if (_webSocketServer.IsListening)
-                _webSocketServer.Stop();
-        }
+    /// <inheritdoc/>
+    public void StopListening()
+    {
+        if (HttpListener != null && IsListening)
+            HttpListener.Stop();
+    }
 
-        /// <summary>
-        /// Gets whether the channel is listening or not.
-        /// </summary>
-        public bool IsListening => _webSocketServer != null && _webSocketServer.IsListening;
+    /// <inheritdoc/>
+    public void Dispose()
+    {
+        StopListening();
+        HttpListener = null;
 
-        /// <summary>
-        /// Stops listening and frees managed resources.
-        /// </summary>
-        public void Dispose()
-        {
-            StopListening();
-            _webSocketServer = null;
-            _server = null;
-        }
+        foreach (var conn in Connections.Values)
+            conn.Dispose();
     }
 }

@@ -13,6 +13,7 @@ using CoreRemoting.RemoteDelegates;
 using CoreRemoting.Encryption;
 using CoreRemoting.Serialization;
 using Serialize.Linq.Nodes;
+using CoreRemoting.Toolbox;
 
 namespace CoreRemoting
 {
@@ -29,6 +30,7 @@ namespace CoreRemoting
         private readonly RsaKeyPair _keyPair;
         private readonly Guid _sessionId;
         private readonly byte[] _clientPublicKeyBlob;
+        private readonly string _clientAddress;
         private readonly RemoteDelegateInvocationEventAggregator _remoteDelegateInvocationEventAggregator;
         private IDelegateProxyFactory _delegateProxyFactory;
         private ConcurrentDictionary<Guid, IDelegateProxy> _delegateProxyCache;
@@ -42,7 +44,7 @@ namespace CoreRemoting
         /// Event: Fired before the session is disposed to do some clean up.
         /// </summary>
         public event Action BeforeDispose;
-        
+
         #endregion
 
         #region Construction
@@ -52,10 +54,11 @@ namespace CoreRemoting
         /// </summary>
         /// <param name="keySize">Key size of the RSA keys for asymmetric encryption</param>
         /// <param name="clientPublicKey">Public key of this session's client</param>
+        /// <param name="clientAddress">Client's network address</param>
         /// <param name="server">Server instance, that hosts this session</param>
         /// <param name="rawMessageTransport">Component, that does the raw message transport (send and receive)</param>
-        internal RemotingSession(int keySize, byte[] clientPublicKey, IRemotingServer server,
-            IRawMessageTransport rawMessageTransport)
+        internal RemotingSession(int keySize, byte[] clientPublicKey, string clientAddress,
+            IRemotingServer server, IRawMessageTransport rawMessageTransport)
         {
             _isDisposing = false;
             _currentlyProcessedMessagesCounter = new CountdownEvent(initialCount: 1);
@@ -70,7 +73,8 @@ namespace CoreRemoting
             _delegateProxyCache = new ConcurrentDictionary<Guid, IDelegateProxy>();
             _rawMessageTransport = rawMessageTransport ?? throw new ArgumentNullException(nameof(rawMessageTransport));
             _clientPublicKeyBlob = clientPublicKey;
-            
+            _clientAddress = clientAddress;
+
             _rawMessageTransport.ReceiveMessage += OnReceiveMessage;
             _rawMessageTransport.ErrorOccured += OnErrorOccured;
 
@@ -100,7 +104,7 @@ namespace CoreRemoting
                                 rawData: rawContent)
                     };
 
-                var rawData = _server.Serializer.Serialize(typeof(SignedMessageData), signedMessageData); 
+                var rawData = _server.Serializer.Serialize(typeof(SignedMessageData), signedMessageData);
 
                 completeHandshakeMessage =
                     new WireMessage
@@ -122,6 +126,10 @@ namespace CoreRemoting
             _remoteDelegateInvocationEventAggregator.RemoteDelegateInvocationNeeded +=
                 (_, uniqueCallKey, handlerKey, arguments) =>
                 {
+                    // handle graceful client disconnection
+                    if (_isDisposing)
+                        return null;
+
                     var sharedSecret =
                         MessageEncryption
                             ? _sessionId.ToByteArray()
@@ -134,7 +142,7 @@ namespace CoreRemoting
                             HandlerKey = handlerKey,
                             DelegateArguments = arguments
                         };
-                    
+
                     var remoteDelegateInvocationWebsocketMessage =
                         _server.MessageEncryptionManager
                             .CreateWireMessage(
@@ -144,14 +152,27 @@ namespace CoreRemoting
                                 keyPair: _keyPair,
                                 messageType: "invoke");
 
-                    // Invoke remote delegate on client
-                    _rawMessageTransport?.SendMessage(
-                        _server.Serializer.Serialize(remoteDelegateInvocationWebsocketMessage));
+                    try
+                    {
+                        // Invoke remote delegate on client
+                        _rawMessageTransport?.SendMessageAsync(
+                            _server.Serializer.Serialize(remoteDelegateInvocationWebsocketMessage))
+                                .JustWait();
+                    }
+                    catch (Exception ex)
+                    {
+                        // handle unexpected client disconnection
+                        OnErrorOccured("Failed to dispatch the remote event. " +
+                            $"Session: {SessionId}, Unique call key: {uniqueCallKey}, " +
+                            $"Handler key: {handlerKey}", ex);
+                    }
 
                     return null;
                 };
 
-            _rawMessageTransport?.SendMessage(_server.Serializer.Serialize(completeHandshakeMessage));
+            _rawMessageTransport?.SendMessageAsync(
+                _server.Serializer.Serialize(completeHandshakeMessage))
+                    .JustWait();
         }
 
         /// <summary>
@@ -161,8 +182,8 @@ namespace CoreRemoting
         /// <param name="ex">Optional exception from the transport infrastructure</param>
         private void OnErrorOccured(string errorMessage, Exception ex)
         {
-            var exception = new RemotingException(errorMessage, innerEx: ex); 
-            
+            var exception = new RemotingException(errorMessage, innerEx: ex);
+
             ((RemotingServer)_server).OnError(exception);
         }
 
@@ -179,6 +200,11 @@ namespace CoreRemoting
         /// Gets this session's unique session ID.
         /// </summary>
         public Guid SessionId => _sessionId;
+
+        /// <summary>
+        /// Gets this session's client network address.
+        /// </summary>
+        public string ClientAddress => _clientAddress;
 
         /// <summary>
         /// Gets whether message encryption is enabled for this session.
@@ -230,56 +256,57 @@ namespace CoreRemoting
         /// Event procedure: Called when the ReceiveMessage event is fired on the raw message transport component.
         /// </summary>
         /// <param name="rawMessage">Raw message data that has been received</param>
-        private void OnReceiveMessage(byte[] rawMessage)
+        private async void OnReceiveMessage(byte[] rawMessage)
         {
-            Task.Run(() =>
+            _lastActivityTimestamp = DateTime.Now;
+
+            if (rawMessage == null)
+                return;
+
+            if (rawMessage.Length == 0)
+                return;
+
+            _currentlyProcessedMessagesCounter.AddCount(1);
+
+            CurrentSession.Value = this;
+
+            try
             {
-                _lastActivityTimestamp = DateTime.Now;
-            
-                if (rawMessage == null)
-                    return;
-            
-                if (rawMessage.Length == 0)
-                    return;
-                
-                _currentlyProcessedMessagesCounter.AddCount(1);
-                
                 var message = _server.Serializer.Deserialize<WireMessage>(rawMessage);
 
-                try
+                switch (message.MessageType.ToLower())
                 {
-                    switch (message.MessageType.ToLower())
-                    {
-                        case "auth":
-                            ProcessAuthenticationRequestMessage(message);
-                            break;
-                        case "rpc":
-                            ProcessRpcMessage(message);
-                            break;
-                        case "goodbye":
-                            ProcessGoodbyeMessage(message);
-                            break;
-                        default:
-                            OnErrorOccured("Invalid message type " + message.MessageType + ".", ex: null);
-                            break;
-                    }
+                    case "auth":
+                        await ProcessAuthenticationRequestMessage(message).ConfigureAwait(false);
+                        break;
+                    case "rpc":
+                        await ProcessRpcMessage(message).ConfigureAwait(false);
+                        break;
+                    case "goodbye":
+                        await ProcessGoodbyeMessage(message).ConfigureAwait(false);
+                        break;
+                    default:
+                        OnErrorOccured("Invalid message type " + message.MessageType + ".", ex: null);
+                        break;
                 }
-                catch (Exception ex)
-                {
-                    OnErrorOccured("Error processing message.", ex);
-                }
-                finally
-                {
-                    _currentlyProcessedMessagesCounter.Signal();
-                }
-            });
+            }
+            catch (Exception ex)
+            {
+                OnErrorOccured("Error processing message.", ex);
+            }
+            finally
+            {
+                _currentlyProcessedMessagesCounter.Signal();
+
+                CurrentSession.Value = null;
+            }
         }
 
         /// <summary>
-        /// Processes a wire message that contains a goodbye message, which is sent from a client to close the session. 
+        /// Processes a wire message that contains a goodbye message, which is sent from a client to close the session.
         /// </summary>
         /// <param name="request">Wire message from client</param>
-        private void ProcessGoodbyeMessage(WireMessage request)
+        private async Task ProcessGoodbyeMessage(WireMessage request)
         {
             var sharedSecret =
                 MessageEncryption
@@ -295,29 +322,33 @@ namespace CoreRemoting
                             sharedSecret: sharedSecret,
                             sendersPublicKeyBlob: _clientPublicKeyBlob,
                             sendersPublicKeySize: _keyPair?.KeySize ?? 0));
-            
+
             if (goodbyeMessage.SessionId != _sessionId)
                 return;
 
             var resultMessage =
                 _server.MessageEncryptionManager.CreateWireMessage(
                     messageType: request.MessageType,
-                    serializedMessage: new byte[0],
+                    serializedMessage: [],
                     serializer: _server.Serializer,
                     keyPair: _keyPair,
                     sharedSecret: sharedSecret,
                     uniqueCallKey: request.UniqueCallKey);
-            
-            _rawMessageTransport.SendMessage(_server.Serializer.Serialize(resultMessage));
-            
-            _server.SessionRepository.RemoveSession(_sessionId);
+
+            await _rawMessageTransport.SendMessageAsync(
+                _server.Serializer.Serialize(resultMessage))
+                    .ConfigureAwait(false);
+
+            ((RemotingServer)_server).OnLogoff();
+
+            _ = Task.Run(() => _server.SessionRepository.RemoveSession(_sessionId));
         }
 
         /// <summary>
-        /// Processes a wire message that contains a authentication request message, which is sent from a client to request authentication of a set of credentials. 
+        /// Processes a wire message that contains a authentication request message, which is sent from a client to request authentication of a set of credentials.
         /// </summary>
         /// <param name="request">Wire message from client</param>
-        private void ProcessAuthenticationRequestMessage(WireMessage request)
+        private async Task ProcessAuthenticationRequestMessage(WireMessage request)
         {
             if (_isAuthenticated)
                 return;
@@ -361,8 +392,11 @@ namespace CoreRemoting
                     keyPair: _keyPair,
                     messageType: "auth_response");
 
-            _rawMessageTransport.SendMessage(
-                _server.Serializer.Serialize(wireMessage));
+            await _rawMessageTransport.SendMessageAsync(
+                _server.Serializer.Serialize(wireMessage))
+                    .ConfigureAwait(false);
+
+            ((RemotingServer)_server).OnLogon();
         }
 
         /// <summary>
@@ -371,7 +405,7 @@ namespace CoreRemoting
         /// <param name="request">RPC message from client</param>
         /// <returns>Task which provides the serialized response message containing the method result asynchronously</returns>
         /// <exception cref="MissingMethodException">Thrown if specified method in request doesn't exist</exception>
-        private void ProcessRpcMessage(WireMessage request)
+        private async Task ProcessRpcMessage(WireMessage request)
         {
             var sharedSecret =
                 MessageEncryption
@@ -390,39 +424,48 @@ namespace CoreRemoting
                 _server.Serializer
                     .Deserialize<MethodCallMessage>(decryptedRawMessage);
 
-            ServerRpcContext serverRpcContext =
+            var serverRpcContext =
                 new ServerRpcContext
                 {
                     UniqueCallKey =
                         request.UniqueCallKey == null
                             ? Guid.Empty
                             : new Guid(request.UniqueCallKey),
+                    AuthenticationRequired = _server.Config.AuthenticationRequired,
                     ServiceInstance = null,
                     MethodCallMessage = callMessage,
+                    MethodCallParameterValues = [],
+                    MethodCallParameterTypes = [],
                     Session = this
                 };
 
+            using var scope = _server.ServiceRegistry.CreateScope();
             var serializedResult = Array.Empty<byte>();
             var method = default(MethodInfo);
-            var parameterValues = Array.Empty<object>();
-            var parameterTypes = Array.Empty<Type>();
             var oneWay = false;
 
             try
             {
+                CallContext.RestoreFromSnapshot(callMessage.CallContextSnapshot);
+
+                callMessage.UnwrapParametersFromDeserializedMethodCallMessage(
+                    out var parameterValues,
+                    out var parameterTypes);
+
+                parameterValues = MapArguments(parameterValues, parameterTypes);
+                serverRpcContext.MethodCallParameterValues = parameterValues;
+                serverRpcContext.MethodCallParameterTypes = parameterTypes;
+
+                ((RemotingServer)_server).OnBeginCall(serverRpcContext);
+
+                if (serverRpcContext.AuthenticationRequired && !_isAuthenticated)
+                    throw new NetworkException("Session is not authenticated.");
+
                 var service = _server.ServiceRegistry.GetService(callMessage.ServiceName);
                 var serviceInterfaceType =
                     _server.ServiceRegistry.GetServiceInterfaceType(callMessage.ServiceName);
 
-                CallContext.RestoreFromSnapshot(callMessage.CallContextSnapshot);
-
                 serverRpcContext.ServiceInstance = service;
-
-                callMessage.UnwrapParametersFromDeserializedMethodCallMessage(
-                    out parameterValues,
-                    out parameterTypes);
-
-                parameterValues = MapArguments(parameterValues, parameterTypes);
 
                 method = GetMethodInfo(callMessage, serviceInterfaceType, parameterTypes);
                 if (method == null)
@@ -431,16 +474,17 @@ namespace CoreRemoting
                         methodName: callMessage.MethodName);
 
                 oneWay = method.GetCustomAttribute<OneWayAttribute>() != null;
-
-                if (_server.Config.AuthenticationRequired && !_isAuthenticated)
-                    throw new NetworkException("Session is not authenticated.");
             }
             catch (Exception ex)
             {
+                ex = ex.SkipTargetInvocationExceptions();
+
                 serverRpcContext.Exception =
                     new RemoteInvocationException(
                         message: ex.Message,
-                        innerEx: ex.GetType().IsSerializable ? ex : null);
+                        innerEx: ex.ToSerializable());
+
+                ((RemotingServer)_server).OnRejectCall(serverRpcContext);
 
                 if (oneWay)
                     return;
@@ -455,11 +499,10 @@ namespace CoreRemoting
             {
                 try
                 {
-                    CurrentSession.Value = this;
-
                     ((RemotingServer)_server).OnBeforeCall(serverRpcContext);
 
-                    result = method.Invoke(serverRpcContext.ServiceInstance, parameterValues);
+                    result = method.Invoke(serverRpcContext.ServiceInstance,
+                        serverRpcContext.MethodCallParameterValues);
 
                     var returnType = method.ReturnType;
 
@@ -503,10 +546,12 @@ namespace CoreRemoting
                 }
                 catch (Exception ex)
                 {
+                    ex = ex.SkipTargetInvocationExceptions();
+
                     serverRpcContext.Exception =
                         new RemoteInvocationException(
                             message: ex.Message,
-                            innerEx: ex.GetType().IsSerializable ? ex : null);
+                            innerEx: ex.ToSerializable());
 
                     ((RemotingServer)_server).OnAfterCall(serverRpcContext);
 
@@ -515,10 +560,6 @@ namespace CoreRemoting
 
                     serializedResult =
                         _server.Serializer.Serialize(serverRpcContext.Exception);
-                }
-                finally
-                {
-                    CurrentSession.Value = null;
                 }
 
                 if (!oneWay)
@@ -530,17 +571,22 @@ namespace CoreRemoting
                                 serializer: _server.Serializer,
                                 uniqueCallKey: serverRpcContext.UniqueCallKey,
                                 method: method,
-                                args: parameterValues,
+                                args: serverRpcContext.MethodCallParameterValues,
                                 returnValue: result);
                 }
 
-                ((RemotingServer)_server).OnAfterCall(serverRpcContext);
+                if (serverRpcContext.Exception == null)
+                    ((RemotingServer)_server).OnAfterCall(serverRpcContext);
 
                 if (oneWay)
                     return;
 
-                serializedResult =
-                    _server.Serializer.Serialize(serverRpcContext.MethodCallResultMessage);
+                // don't overwrite the serialized exception
+                if (ReferenceEquals(serializedResult, Array.Empty<byte>()))
+                {
+                    serializedResult =
+                        _server.Serializer.Serialize(serverRpcContext.MethodCallResultMessage);
+                }
             }
 
             var methodResultMessage =
@@ -553,10 +599,9 @@ namespace CoreRemoting
                     messageType: "rpc_result",
                     uniqueCallKey: serverRpcContext.UniqueCallKey.ToByteArray());
 
-            _rawMessageTransport.SendMessage(
-                _server.Serializer.Serialize(methodResultMessage));
-
-            CurrentSession.Value = null;
+            await _rawMessageTransport.SendMessageAsync(
+                _server.Serializer.Serialize(methodResultMessage))
+                    .ConfigureAwait(false);
         }
 
         private MethodInfo GetMethodInfo(MethodCallMessage callMessage, Type serviceInterfaceType, Type[] parameterTypes)
@@ -622,7 +667,7 @@ namespace CoreRemoting
         private object[] MapArguments(object[] arguments, Type[] argumentTypes)
         {
             object[] mappedArguments = new object[arguments.Length];
-            
+
             for (int i = 0; i < arguments.Length; i++)
             {
                 var argument = arguments[i];
@@ -635,10 +680,10 @@ namespace CoreRemoting
                 else
                     mappedArguments[i] = argument;
             }
-            
+
             return mappedArguments;
         }
-        
+
         /// <summary>
         /// Maps a delegate argument into a delegate proxy.
         /// </summary>
@@ -695,13 +740,13 @@ namespace CoreRemoting
                 mappedArgument = argument;
                 return false;
             }
-            
+
             var expression = ((ExpressionNode)argument).ToExpression();
             mappedArgument = expression;
-            
+
             return true;
         }
-        
+
         #endregion
 
         #region Close session
@@ -718,7 +763,7 @@ namespace CoreRemoting
         }
 
         #endregion
-        
+
         #region IDisposable implementation
 
         /// <summary>
@@ -730,18 +775,18 @@ namespace CoreRemoting
                 return;
 
             _isDisposing = true;
-            
+
             _rawMessageTransport.ReceiveMessage -= OnReceiveMessage;
             _rawMessageTransport.ErrorOccured -= OnErrorOccured;
-            
+
             _currentlyProcessedMessagesCounter.Signal();
             _currentlyProcessedMessagesCounter.Wait(_server.Config.WaitTimeForCurrentlyProcessedMessagesOnDispose);
-            
+
             var sharedSecret =
                 MessageEncryption
                     ? _sessionId.ToByteArray()
                     : null;
-            
+
             var wireMessage =
                 _server.MessageEncryptionManager.CreateWireMessage(
                     serializedMessage: Array.Empty<byte>(),
@@ -750,11 +795,20 @@ namespace CoreRemoting
                     keyPair: _keyPair,
                     messageType: "session_closed");
 
-            _rawMessageTransport.SendMessage(
-                _server.Serializer.Serialize(wireMessage));
-            
+            try
+            {
+                _rawMessageTransport.SendMessageAsync(
+                    _server.Serializer.Serialize(wireMessage))
+                        .JustWait();
+            }
+            catch (Exception)
+            {
+                // ignored
+                // TODO: dispatch the exception
+            }
+
             BeforeDispose?.Invoke();
-            
+
             _keyPair?.Dispose();
             _delegateProxyFactory = null;
             _delegateProxyCache.Clear();
@@ -764,7 +818,7 @@ namespace CoreRemoting
         }
 
         #endregion
-        
+
         #region Retrieving current session
 
         /// <summary>

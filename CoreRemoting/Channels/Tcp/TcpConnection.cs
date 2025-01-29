@@ -1,5 +1,6 @@
 using System;
 using System.Collections.Generic;
+using System.Threading.Tasks;
 using WatsonTcp;
 
 namespace CoreRemoting.Channels.Tcp;
@@ -82,6 +83,7 @@ public class TcpConnection : IRawMessageTransport
             _session = 
                 _server.SessionRepository.CreateSession(
                     clientPublicKey,
+                    _clientMetadata.IpPort,
                     _server,
                     this);
                 
@@ -97,15 +99,14 @@ public class TcpConnection : IRawMessageTransport
     private void BeforeDisposeSession()
     {
         _session = null;
-        _tcpServer.DisconnectClient(_clientMetadata.Guid, MessageStatus.Shutdown);
+        _tcpServer.DisconnectClientAsync(_clientMetadata.Guid, MessageStatus.Shutdown);
     }
 
     /// <summary>
     /// Sends a message to the server.
     /// </summary>
     /// <param name="rawMessage">Raw message data</param>
-    public bool SendMessage(byte[] rawMessage)
-    {
-        return _tcpServer.Send(_clientMetadata.Guid, rawMessage);
-    }
+    public async Task<bool> SendMessageAsync(byte[] rawMessage) =>
+        await _tcpServer.SendAsync(_clientMetadata.Guid, rawMessage)
+            .ConfigureAwait(false);
 }

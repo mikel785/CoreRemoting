@@ -2,7 +2,6 @@ using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using WebSocketSharp;
 
 namespace CoreRemoting.DependencyInjection;
 
@@ -32,8 +31,8 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
             return _serviceNameRegistry.Values;
         else
             return _serviceNameRegistry.Values.Where(registration => !registration.IsHiddenSystemService);
-    }    
-    
+    }
+
     /// <summary>
     /// Returns a service registration by unique service name.
     /// </summary>
@@ -62,7 +61,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     /// <returns>Service instance</returns>
     protected abstract TServiceInterface ResolveServiceFromContainer<TServiceInterface>(ServiceRegistration registration)
         where TServiceInterface : class;
-    
+
     /// <summary>
     /// Gets the service interface type of a specified service.
     /// </summary>
@@ -73,7 +72,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
         var registration = GetServiceRegistration(serviceName);
         return registration.InterfaceType;
     }
-    
+
     /// <summary>
     /// Gets a service instance by service name.
     /// </summary>
@@ -94,13 +93,13 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     public TServiceInterface GetService<TServiceInterface>(string serviceName = "")
         where TServiceInterface : class
     {
-        if (serviceName.IsNullOrEmpty())
+        if (string.IsNullOrEmpty(serviceName))
             serviceName = typeof(TServiceInterface).FullName;
-        
+
         var registration = GetServiceRegistration(serviceName);
         return ResolveServiceFromContainer<TServiceInterface>(registration);
     }
-    
+
     /// <summary>
     /// Registers a service in the dependency injection container.
     /// </summary>
@@ -109,7 +108,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     /// <typeparam name="TServiceInterface">Service interface type</typeparam>
     /// <typeparam name="TServiceImpl">Service implementation type</typeparam>
     protected abstract void RegisterServiceInContainer<TServiceInterface, TServiceImpl>(
-        ServiceLifetime lifetime, 
+        ServiceLifetime lifetime,
         string serviceName = "")
         where TServiceInterface : class
         where  TServiceImpl : class, TServiceInterface;
@@ -122,8 +121,8 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     /// <param name="serviceName">Optional unique service name</param>
     /// <typeparam name="TServiceInterface">Service interface type</typeparam>
     protected abstract void RegisterServiceInContainer<TServiceInterface>(
-        Func<TServiceInterface> factoryDelegate, 
-        ServiceLifetime lifetime, 
+        Func<TServiceInterface> factoryDelegate,
+        ServiceLifetime lifetime,
         string serviceName = "")
         where TServiceInterface : class;
 
@@ -143,10 +142,10 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
         where TServiceImpl : class, TServiceInterface
     {
         var serviceInterfaceType = typeof(TServiceInterface);
-            
+
         if (string.IsNullOrWhiteSpace(serviceName))
             serviceName = serviceInterfaceType.FullName;
-            
+
         if (_serviceNameRegistry.ContainsKey(serviceName!))
             return;
 
@@ -159,7 +158,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
                 serviceLifetime: lifetime,
                 factory: null,
                 isHiddenSystemService: asHiddenSystemService));
-        
+
         RegisterServiceInContainer<TServiceInterface, TServiceImpl>(lifetime, serviceName);
     }
 
@@ -179,10 +178,10 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
         where TServiceInterface : class
     {
         var serviceInterfaceType = typeof(TServiceInterface);
-            
+
         if (string.IsNullOrWhiteSpace(serviceName))
             serviceName = serviceInterfaceType.FullName;
-            
+
         if (_serviceNameRegistry.ContainsKey(serviceName!))
             return;
 
@@ -195,7 +194,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
                 serviceLifetime: lifetime,
                 factory: factoryDelegate,
                 isHiddenSystemService: asHiddenSystemService));
-        
+
         RegisterServiceInContainer(factoryDelegate, lifetime, serviceName);
     }
 
@@ -204,7 +203,7 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     /// </summary>
     /// <returns>Enumerable list of registered types</returns>
     public abstract IEnumerable<Type> GetAllRegisteredTypes();
-    
+
     /// <summary>
     /// Gets whether the specified service is registered or not.
     /// </summary>
@@ -212,6 +211,9 @@ public abstract class DependencyInjectionContainerBase : IDependencyInjectionCon
     /// <typeparam name="TServiceInterface">Service interface type</typeparam>
     /// <returns>True, if the service is registered, otherwise false</returns>
     public abstract bool IsRegistered<TServiceInterface>(string serviceName = "") where TServiceInterface : class;
+
+    /// <inheritdoc/>
+    public abstract IDisposable CreateScope();
 
     /// <summary>
     /// Frees managed resources.

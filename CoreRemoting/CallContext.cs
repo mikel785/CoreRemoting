@@ -12,7 +12,7 @@ namespace CoreRemoting
     {
         private static readonly ConcurrentDictionary<string, AsyncLocal<object>> State = 
             new ConcurrentDictionary<string, AsyncLocal<object>>();
-        
+
         /// <summary>
         /// Stores a given object and associates it with the specified name.
         /// </summary>
@@ -35,12 +35,12 @@ namespace CoreRemoting
         /// <returns>Array of call context entries</returns>
         public static CallContextEntry[] GetSnapshot()
         {
-            var stateSnaphsot = State.ToArray();
-            var result = new CallContextEntry[stateSnaphsot.Length];
+            var stateSnapshot = State.ToArray();
+            var result = new CallContextEntry[stateSnapshot.Length];
 
-            for(int i = 0; i< stateSnaphsot.Length; i++)
+            for(int i = 0; i< stateSnapshot.Length; i++)
             {
-                var entry = stateSnaphsot[i];
+                var entry = stateSnapshot[i];
                 
                 result[i] =
                     new CallContextEntry
@@ -67,7 +67,7 @@ namespace CoreRemoting
                 }
                 return;
             }
-            
+
             foreach (var entry in entries)
             {
                 CallContext.SetData(entry.Name, entry.Value);

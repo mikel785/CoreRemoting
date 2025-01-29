@@ -11,6 +11,7 @@ using CoreRemoting.RemoteDelegates;
 using CoreRemoting.Serialization;
 using CoreRemoting.Serialization.Bson;
 using ServiceLifetime = CoreRemoting.DependencyInjection.ServiceLifetime;
+using System.Runtime.ExceptionServices;
 
 namespace CoreRemoting
 {
@@ -22,13 +23,13 @@ namespace CoreRemoting
         private readonly IDependencyInjectionContainer _container;
         private readonly ServerConfig _config;
         private readonly string _uniqueServerInstanceName;
-        
+
         // ReSharper disable once InconsistentNaming
-        private static readonly ConcurrentDictionary<string, IRemotingServer> _serverInstances = 
+        private static readonly ConcurrentDictionary<string, IRemotingServer> _serverInstances =
             new ConcurrentDictionary<string, IRemotingServer>();
 
         private static WeakReference<IRemotingServer> _defaultRemotingServerRef;
-        
+
         /// <summary>
         /// Creates a new instance of the RemotingServer class.
         /// </summary>
@@ -37,11 +38,11 @@ namespace CoreRemoting
         {
             _config = config ?? new ServerConfig();
 
-            _uniqueServerInstanceName = 
-                string.IsNullOrWhiteSpace(_config.UniqueServerInstanceName) 
-                    ? Guid.NewGuid().ToString() 
+            _uniqueServerInstanceName =
+                string.IsNullOrWhiteSpace(_config.UniqueServerInstanceName)
+                    ? Guid.NewGuid().ToString()
                     : _config.UniqueServerInstanceName;
-            
+
             _serverInstances.AddOrUpdate(
                 key: _config.UniqueServerInstanceName,
                 addValueFactory: _ => this,
@@ -50,38 +51,58 @@ namespace CoreRemoting
                     oldServer?.Dispose();
                     return this;
                 });
-            
-            SessionRepository = 
-                _config.SessionRepository ?? 
-                    new SessionRepository( 
+
+            SessionRepository =
+                _config.SessionRepository ??
+                    new SessionRepository(
                         keySize: _config.KeySize,
                         inactiveSessionSweepInterval: _config.InactiveSessionSweepInterval,
                         maximumSessionInactivityTime: _config.MaximumSessionInactivityTime);
-            
+
             _container = _config.DependencyInjectionContainer ?? new CastleWindsorDependencyInjectionContainer();
             Serializer = _config.Serializer ?? new BsonSerializerAdapter();
             MethodCallMessageBuilder = new MethodCallMessageBuilder();
             MessageEncryptionManager = new MessageEncryptionManager();
-            
+
             _container.RegisterService<IDelegateProxyFactory, DelegateProxyFactory>(
                 lifetime: ServiceLifetime.Singleton,
                 asHiddenSystemService: true);
-            
+
             _config.RegisterServicesAction?.Invoke(_container);
 
             Channel = _config.Channel ?? new TcpServerChannel();
-            
+
             Channel.Init(this);
-            
+
             if (_config.IsDefault)
                 RemotingServer.DefaultRemotingServer ??= this;
         }
-        
+
+        /// <summary>
+        /// Event: Fires when a client logs on.
+        /// </summary>
+        public event EventHandler Logon;
+
+        /// <summary>
+        /// Event: Fires when a client logs off.
+        /// </summary>
+        public event EventHandler Logoff;
+
+        /// <summary>
+        /// Event: Fires when an RPC call is prepared and can be canceled.
+        /// </summary>
+        public event EventHandler<ServerRpcContext> BeginCall;
+
+        /// <summary>
+        /// Event: Fires when an RPC call is rejected before BeforeCall event.
+        /// </summary>
+        public event EventHandler<ServerRpcContext> RejectCall;
+
         /// <summary>
         /// Event: Fires before an RPC call is invoked.
         /// </summary>
         public event EventHandler<ServerRpcContext> BeforeCall;
-        
+
         /// <summary>
         /// Event: Fires after an RPC call is invoked.
         /// </summary>
@@ -91,7 +112,7 @@ namespace CoreRemoting
         /// Event: Fires if an error occurs.
         /// </summary>
         public event EventHandler<Exception> Error;
-        
+
         /// <summary>
         /// Gets the dependency injection container that is used a service registry.
         /// </summary>
@@ -106,7 +127,7 @@ namespace CoreRemoting
         /// Gets the configuration settings.
         /// </summary>
         public ServerConfig Config => _config;
-        
+
         /// <summary>
         /// Gets the configured serializer.
         /// </summary>
@@ -121,7 +142,7 @@ namespace CoreRemoting
         /// Gets the component for encryption and decryption of messages.
         /// </summary>
         public IMessageEncryptionManager MessageEncryptionManager { get; }
-        
+
         /// <summary>
         /// Gets the session repository to perform session management tasks.
         /// </summary>
@@ -134,7 +155,7 @@ namespace CoreRemoting
         public IServerChannel Channel { get; private set; }
 
         /// <summary>
-        /// Fires the OnBeforeCall event.
+        /// Fires the <see cref="BeforeCall"/> event.
         /// </summary>
         /// <param name="serverRpcContext">Server side RPC call context</param>
         internal void OnBeforeCall(ServerRpcContext serverRpcContext)
@@ -143,7 +164,7 @@ namespace CoreRemoting
         }
 
         /// <summary>
-        /// Fires the OnAfterCall event.
+        /// Fires the <see cref="AfterCall"/> event.
         /// </summary>
         /// <param name="serverRpcContext">Server side RPC call context</param>
         internal void OnAfterCall(ServerRpcContext serverRpcContext)
@@ -152,14 +173,59 @@ namespace CoreRemoting
         }
 
         /// <summary>
-        /// Fires the OnError event.
+        /// Fires the <see cref="Error"/> event.
         /// </summary>
         /// <param name="ex">Exception that describes the occurred error</param>
         internal void OnError(Exception ex)
         {
             Error?.Invoke(this, ex);
         }
-        
+
+        /// <summary>
+        /// Fires the <see cref="RejectCall"/> event.
+        /// </summary>
+        /// <param name="serverRpcContext">Server side RPC call context</param>
+        internal void OnRejectCall(ServerRpcContext serverRpcContext)
+        {
+            RejectCall?.Invoke(this, serverRpcContext);
+        }
+
+        /// <summary>
+        /// Fires the <see cref="BeginCall"/> event.
+        /// </summary>
+        /// <param name="serverRpcContext">Server side RPC call context</param>
+        internal void OnBeginCall(ServerRpcContext serverRpcContext)
+        {
+            BeginCall?.Invoke(this, serverRpcContext);
+
+            if (serverRpcContext.Cancel)
+            {
+                var cancelEx = serverRpcContext.Exception ??
+                    new RemoteInvocationException($"Invocation canceled: {
+                        serverRpcContext.MethodCallMessage.ServiceName}.{
+                        serverRpcContext.MethodCallMessage.MethodName}");
+
+                // rethrow the exception keeping the original stack trace
+                ExceptionDispatchInfo.Capture(cancelEx).Throw();
+            }
+        }
+
+        /// <summary>
+        /// Fires the <see cref="Logon"/> event.
+        /// </summary>
+        internal void OnLogon()
+        {
+            Logon?.Invoke(this, EventArgs.Empty);
+        }
+
+        /// <summary>
+        /// Fires the <see cref="Logoff"/> event.
+        /// </summary>
+        internal void OnLogoff()
+        {
+            Logoff?.Invoke(this, EventArgs.Empty);
+        }
+
         /// <summary>
         /// Starts listening for client requests.
         /// </summary>
@@ -184,13 +250,21 @@ namespace CoreRemoting
         /// <returns>True when authentication was successful, otherwise false</returns>
         public bool Authenticate(Credential[] credentials, out RemotingIdentity authenticatedIdentity)
         {
+            authenticatedIdentity = null;
+
             if (_config.AuthenticationProvider == null)
+                return false;
+
+            try
             {
-                authenticatedIdentity = null;
+                return _config.AuthenticationProvider.Authenticate(credentials, out authenticatedIdentity);
+            }
+            catch (Exception ex)
+            {
+                OnError(ex);
+
                 return false;
             }
-
-            return _config.AuthenticationProvider.Authenticate(credentials, out authenticatedIdentity);
         }
 
         /// <summary>
@@ -200,16 +274,16 @@ namespace CoreRemoting
         {
             if (RemotingServer.DefaultRemotingServer == this)
                 RemotingServer.DefaultRemotingServer = null;
-            
+
             _serverInstances.TryRemove(_config.UniqueServerInstanceName, out _);
-            
+
             if (Channel != null)
             {
                 Channel.Dispose();
                 Channel = null;
             }
         }
-        
+
         #region Managing server instances
 
         /// <summary>
@@ -245,13 +319,13 @@ namespace CoreRemoting
             }
             internal set
             {
-                _defaultRemotingServerRef = 
-                    value == null 
-                        ? null 
+                _defaultRemotingServerRef =
+                    value == null
+                        ? null
                         : new WeakReference<IRemotingServer>(value);
             }
         }
-        
+
         #endregion
     }
 }

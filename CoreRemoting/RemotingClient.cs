@@ -5,7 +5,6 @@ using System.Diagnostics.CodeAnalysis;
 using System.Linq;
 using System.Reflection;
 using System.Security;
-using System.Threading;
 using System.Threading.Tasks;
 using System.Timers;
 using Castle.DynamicProxy;
@@ -17,6 +16,8 @@ using CoreRemoting.RemoteDelegates;
 using CoreRemoting.Encryption;
 using CoreRemoting.Serialization;
 using CoreRemoting.Serialization.Bson;
+using CoreRemoting.Toolbox;
+using CancellationTokenSource = System.Threading.CancellationTokenSource;
 using Timer = System.Timers.Timer;
 
 namespace CoreRemoting
@@ -37,41 +38,40 @@ namespace CoreRemoting
         private Dictionary<Guid, ClientRpcContext> _activeCalls;
         private readonly object _syncObject;
         private Guid _sessionId;
-        private ManualResetEventSlim _handshakeCompletedWaitHandle;
-        private ManualResetEventSlim _authenticationCompletedWaitHandle;
-        private ManualResetEventSlim _goodbyeCompletedWaitHandle;
+        private TaskCompletionSource<bool> _handshakeCompletedTaskSource;
+        private TaskCompletionSource<bool> _authenticationCompletedTaskSource;
+        private TaskCompletionSource<bool> _goodbyeCompletedTaskSource;
         private bool _isAuthenticated;
         private Timer _keepSessionAliveTimer;
         private byte[] _serverPublicKeyBlob;
 
         // ReSharper disable once InconsistentNaming
-        private static readonly ConcurrentDictionary<string, IRemotingClient> _clientInstances = 
-            new ConcurrentDictionary<string, IRemotingClient>();
-        
+        private static readonly ConcurrentDictionary<string, IRemotingClient> _clientInstances = new();
+
         private static WeakReference<IRemotingClient> _defaultRemotingClientRef;
 
         /// <summary>
         /// Event: Fires after client was disconnected.
         /// </summary>
         public event Action AfterDisconnect;
-        
+
         #endregion
-        
+
         #region Construction
-        
+
         private RemotingClient()
         {
             MethodCallMessageBuilder = new MethodCallMessageBuilder();
             MessageEncryptionManager = new MessageEncryptionManager();
             _activeCalls = null;
-            _syncObject = new object();
-            _cancellationTokenSource = new CancellationTokenSource();
-            _delegateRegistry = new ClientDelegateRegistry();
-            _handshakeCompletedWaitHandle = new ManualResetEventSlim(initialState: false);
-            _authenticationCompletedWaitHandle = new ManualResetEventSlim(initialState: false);
-            _goodbyeCompletedWaitHandle = new ManualResetEventSlim(initialState: false);
+            _syncObject = new();
+            _cancellationTokenSource = new();
+            _delegateRegistry = new();
+            _handshakeCompletedTaskSource = new();
+            _authenticationCompletedTaskSource = new();
+            _goodbyeCompletedTaskSource = new();
         }
-        
+
         /// <summary>
         /// Creates a new instance of the RemotingClient class.
         /// </summary>
@@ -80,17 +80,17 @@ namespace CoreRemoting
         {
             if (config == null)
                 throw new ArgumentException("No config provided and no default configuration found.");
-            
+
             Serializer = config.Serializer ?? new BsonSerializerAdapter();
             MessageEncryption = config.MessageEncryption;
-            
+
             _config = config;
-            
+
             if (MessageEncryption)
                 _keyPair = new RsaKeyPair(config.KeySize);
-            
+
             _channel = config.Channel ?? new TcpClientChannel();
-            
+
             _channel.Init(this);
             _channel.Disconnected += OnDisconnected;
             _rawMessageTransport = _channel.RawMessageTransport;
@@ -111,44 +111,40 @@ namespace CoreRemoting
                     oldClient?.Dispose();
                     return this;
                 });
-            
-            if (!config.IsDefault) 
+
+            if (!config.IsDefault)
                 return;
-            
+
             RemotingClient.DefaultRemotingClient ??= this;
         }
 
         private void OnDisconnected()
         {
-            Dictionary<Guid, ClientRpcContext> activeCalls;
-            lock (_syncObject)
-            {
-                if (_activeCalls == null)
-                    return;
+            var activeCalls = _activeCalls;
+            _activeCalls = null;
 
-                activeCalls = _activeCalls;
-                _activeCalls = null;
-            }
-            
-            _goodbyeCompletedWaitHandle.Set();
-            
+            _goodbyeCompletedTaskSource.TrySetResult(true);
+
+            if (activeCalls == null)
+                return;
+
             foreach (var activeCall in activeCalls)
             {
                 activeCall.Value.Error = true;
                 activeCall.Value.RemoteException = new RemoteInvocationException("Server Disconnected");
-                activeCall.Value.WaitHandle.Set();
+                activeCall.Value.TaskSource.TrySetResult(null);
             }
         }
 
         #endregion
-        
+
         #region Properties
 
         /// <summary>
         /// Gets the proxy generator instance.
         /// </summary>
-        private static readonly ProxyGenerator ProxyGenerator = new ProxyGenerator();
-        
+        private static readonly ProxyGenerator ProxyGenerator = new();
+
         /// <summary>
         /// Gets a utility object for building remoting messages.
         /// </summary>
@@ -158,7 +154,7 @@ namespace CoreRemoting
         /// Gets a utility object to provide encryption of remoting messages.
         /// </summary>
         private IMessageEncryptionManager MessageEncryptionManager { get; }
-        
+
         /// <summary>
         /// Gets the configured serializer.
         /// </summary>
@@ -168,12 +164,12 @@ namespace CoreRemoting
         /// Gets the local client delegate registry.
         /// </summary>
         internal ClientDelegateRegistry ClientDelegateRegistry => _delegateRegistry;
-        
+
         /// <summary>
         /// Gets or sets the invocation timeout in milliseconds.
         /// </summary>
         public int? InvocationTimeout { get; set; }
-        
+
         /// <summary>
         /// Gets or sets whether messages should be encrypted or not.
         /// </summary>
@@ -208,46 +204,53 @@ namespace CoreRemoting
             }
         }
 
-        
+
         /// <summary>
         /// Gets the authenticated identity. May be null if authentication failed or if authentication is not configured.
         /// </summary>
-        [SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")] 
+        [SuppressMessage("ReSharper", "UnusedAutoPropertyAccessor.Global")]
         public RemotingIdentity Identity { get; private set; }
-        
+
         #endregion
-        
+
         #region Connection management
-        
+
         /// <summary>
         /// Connects this CoreRemoting client instance to the configured CoreRemoting server.
         /// </summary>
         /// <exception cref="RemotingException">Thrown, if no channel is configured.</exception>
         /// <exception cref="NetworkException">Thrown, if handshake with server failed.</exception>
-        public void Connect()
+        public void Connect() =>
+            ConnectAsync().JustWait();
+
+        /// <summary>
+        /// Connects this CoreRemoting client instance to the configured CoreRemoting server.
+        /// </summary>
+        /// <exception cref="RemotingException">Thrown, if no channel is configured.</exception>
+        /// <exception cref="NetworkException">Thrown, if handshake with server failed.</exception>
+        public async Task ConnectAsync()
         {
             if (_channel == null)
                 throw new RemotingException("No client channel configured.");
 
-            _goodbyeCompletedWaitHandle.Reset();
+            _goodbyeCompletedTaskSource = new();
             lock(_syncObject)
                 _activeCalls = new Dictionary<Guid, ClientRpcContext>();
-            
-            _channel.Connect();
+
+            await _channel.ConnectAsync()
+                .ConfigureAwait(false);
 
             if (_channel.RawMessageTransport.LastException != null)
                 throw _channel.RawMessageTransport.LastException;
 
-            if (_config.ConnectionTimeout == 0)
-                _handshakeCompletedWaitHandle.Wait();
-            else
-                _handshakeCompletedWaitHandle.Wait(_config.ConnectionTimeout * 1000);
+            await _handshakeCompletedTaskSource.Task.Timeout(
+                _config.ConnectionTimeout, () =>
+                    throw new NetworkException("Handshake with server failed."))
+                .ConfigureAwait(false);
 
-            if (!_handshakeCompletedWaitHandle.IsSet)
-                throw new NetworkException("Handshake with server failed.");
-            else
-                Authenticate();
-            
+            await AuthenticateAsync()
+                .ConfigureAwait(false);
+
             StartKeepSessionAliveTimer();
         }
 
@@ -255,7 +258,14 @@ namespace CoreRemoting
         /// Disconnects from the server. The server is actively notified about disconnection.
         /// </summary>
         /// <param name="quiet">When set to true, no goodbye message is sent to the server</param>
-        public void Disconnect(bool quiet = false)
+        public void Disconnect(bool quiet = false) =>
+            DisconnectAsync(quiet).JustWait();
+
+        /// <summary>
+        /// Disconnects from the server. The server is actively notified about disconnection.
+        /// </summary>
+        /// <param name="quiet">When set to true, no goodbye message is sent to the server</param>
+        public async Task DisconnectAsync(bool quiet = false)
         {
             if (_channel == null)
                 return;
@@ -301,20 +311,22 @@ namespace CoreRemoting
 
                 //_goodbyeCompletedWaitHandle.Reset();
 
-                if(_channel.RawMessageTransport.SendMessage(rawData))
-                    _goodbyeCompletedWaitHandle.Wait(10000);
+                if (await _channel.RawMessageTransport.SendMessageAsync(rawData).ConfigureAwait(false))
+                    await _goodbyeCompletedTaskSource.Task.Timeout(10).ConfigureAwait(false);
             }
 
-            lock (_syncObject)
+            // lock (_syncObject) // TODO: why we are locking here?
             {
-                _channel?.Disconnect();
+                var channel = _channel;
+                if (channel != null)
+                    await channel.DisconnectAsync().ConfigureAwait(false);
             }
 
             OnDisconnected();
-            _handshakeCompletedWaitHandle?.Reset();
-            _authenticationCompletedWaitHandle?.Reset();
+            _handshakeCompletedTaskSource = new();
+            _authenticationCompletedTaskSource = new();
             Identity = null;
-            
+
             AfterDisconnect?.Invoke();
         }
 
@@ -325,7 +337,7 @@ namespace CoreRemoting
         {
             if (_config.KeepSessionAliveInterval <= 0)
                 return;
-            
+
             _keepSessionAliveTimer =
                 new Timer(Convert.ToDouble(_config.KeepSessionAliveInterval * 1000));
 
@@ -334,7 +346,7 @@ namespace CoreRemoting
         }
 
         /// <summary>
-        /// Event procedure: Called when the keep session alive timer elapses. 
+        /// Event procedure: Called when the keep session alive timer elapses.
         /// </summary>
         /// <param name="sender">Event sender</param>
         /// <param name="e">Event arguments</param>
@@ -342,10 +354,10 @@ namespace CoreRemoting
         {
             if (_keepSessionAliveTimer == null)
                 return;
-            
+
             if (!_keepSessionAliveTimer.Enabled)
                 return;
-            
+
             if (_rawMessageTransport == null)
                 return;
 
@@ -354,9 +366,9 @@ namespace CoreRemoting
                 OnDisconnected();
                 return;
             }
-            
+
             // Send empty message to keep session alive
-            _rawMessageTransport.SendMessage(new byte[0]);
+            _rawMessageTransport.SendMessageAsync([]).JustWait();
         }
 
         private byte[] SharedSecret()
@@ -375,22 +387,22 @@ namespace CoreRemoting
         }
 
         #endregion
-        
+
         #region Authentication
 
         /// <summary>
         /// Authenticates this CoreRemoting client instance with the specified credentials.
         /// </summary>
         /// <exception cref="SecurityException">Thrown, if authentication failed or timed out</exception>
-        private void Authenticate()
+        private async Task AuthenticateAsync()
         {
             if (_config.Credentials == null || (_config.Credentials!=null && _config.Credentials.Length == 0))
                 return;
-            
-            if (_authenticationCompletedWaitHandle.IsSet)
+
+            if (_authenticationCompletedTaskSource.Task.IsCompleted)
                 return;
 
-            byte[] sharedSecret = SharedSecret();
+            var sharedSecret = SharedSecret();
 
             var authRequestMessage =
                 new AuthenticationRequestMessage
@@ -406,35 +418,36 @@ namespace CoreRemoting
                     keyPair: _keyPair,
                     sharedSecret: sharedSecret);
 
-            byte[] rawData = Serializer.Serialize(wireMessage);
+            var rawData = Serializer.Serialize(wireMessage);
 
             _rawMessageTransport.LastException = null;
-            
-            _rawMessageTransport.SendMessage(rawData);
-            
+
+            await _rawMessageTransport.SendMessageAsync(rawData)
+                .ConfigureAwait(false);
+
             if (_rawMessageTransport.LastException != null)
                 throw _rawMessageTransport.LastException;
 
-            _authenticationCompletedWaitHandle.Wait(_config.AuthenticationTimeout * 1000);
-            
-            if (!_authenticationCompletedWaitHandle.IsSet)
-                throw new SecurityException("Authentication timeout.");
+            await _authenticationCompletedTaskSource.Task.Timeout(
+                _config.AuthenticationTimeout, () =>
+                    throw new SecurityException("Authentication timeout."))
+                        .ConfigureAwait(false);
 
             if (!_isAuthenticated)
                 throw new SecurityException("Authentication failed. Please check credentials.");
         }
 
         #endregion
-        
+
         #region Handling received messages
-        
+
         /// <summary>
         /// Called when a message is received from server.
         /// </summary>
         /// <param name="rawMessage">Raw message data</param>
-        private void OnMessage(byte[] rawMessage)
+        private void OnMessage(byte[] rawMessage) => Task.Run(() =>
         {
-            var message = Serializer.Deserialize<WireMessage>(rawMessage);
+            var message = TryDeserialize(rawMessage);
 
             switch (message.MessageType.ToLower())
             {
@@ -451,11 +464,34 @@ namespace CoreRemoting
                     ProcessRemoteDelegateInvocationMessage(message);
                     break;
                 case "goodbye":
-                    _goodbyeCompletedWaitHandle.Set();
+                    _goodbyeCompletedTaskSource.TrySetResult(true);
                     break;
                 case "session_closed":
                     Disconnect(quiet: true);
                     break;
+                default:
+                    // TODO: how do we handle invalid wire messages received by the client?
+                    // A wire message could have been tampered with and couldn't be deserialized
+                    break;
+            }
+        }).ConfigureAwait(false);
+
+        private WireMessage TryDeserialize(byte[] rawMessage)
+        {
+            try
+            {
+                return Serializer.Deserialize<WireMessage>(rawMessage);
+            }
+            catch // TODO: dispatch message deserialization exception?
+            {
+                return new WireMessage
+                {
+                    Data = rawMessage,
+                    Error = true,
+                    Iv = [],
+                    MessageType = "invalid",
+                    UniqueCallKey = [],
+                };
             }
         }
 
@@ -467,12 +503,12 @@ namespace CoreRemoting
         {
             if (MessageEncryption)
             {
-                var signedMessageData = 
+                var signedMessageData =
                     Serializer.Deserialize<SignedMessageData>(message.Data);
-            
-                var encryptedSecret = 
+
+                var encryptedSecret =
                     Serializer.Deserialize<EncryptedSecret>(signedMessageData.MessageRawData);
-                
+
                 _serverPublicKeyBlob = encryptedSecret.SendersPublicKeyBlob;
 
                 if (!RsaSignature.VerifySignature(
@@ -499,7 +535,7 @@ namespace CoreRemoting
                     _sessionId = new Guid(message.Data);
             }
 
-            _handshakeCompletedWaitHandle.Set();
+            _handshakeCompletedTaskSource.TrySetResult(true);
         }
 
         /// <summary>
@@ -508,8 +544,8 @@ namespace CoreRemoting
         /// <param name="message">Deserialized WireMessage that contains a AuthenticationResponseMessage</param>
         private void ProcessAuthenticationResponseMessage(WireMessage message)
         {
-            byte[] sharedSecret = SharedSecret();
-            
+            var sharedSecret = SharedSecret();
+
             var authResponseMessage =
                 Serializer
                     .Deserialize<AuthenticationResponseMessage>(
@@ -523,8 +559,8 @@ namespace CoreRemoting
             _isAuthenticated = authResponseMessage.IsAuthenticated;
 
             Identity = _isAuthenticated ? authResponseMessage.AuthenticatedIdentity : null;
-            
-            _authenticationCompletedWaitHandle.Set();
+
+            _authenticationCompletedTaskSource.TrySetResult(true);
         }
 
         /// <summary>
@@ -533,8 +569,8 @@ namespace CoreRemoting
         /// <param name="message">Deserialized WireMessage that contains a RemoteDelegateInvocationMessage</param>
         private void ProcessRemoteDelegateInvocationMessage(WireMessage message)
         {
-            byte[] sharedSecret = SharedSecret();
-            
+            var sharedSecret = SharedSecret();
+
             var delegateInvocationMessage =
                 Serializer
                     .Deserialize<RemoteDelegateInvocationMessage>(
@@ -544,14 +580,14 @@ namespace CoreRemoting
                             sharedSecret: sharedSecret,
                             sendersPublicKeyBlob: _serverPublicKeyBlob,
                             sendersPublicKeySize: _keyPair?.KeySize ?? 0));
-            
+
             var localDelegate =
                 _delegateRegistry.GetDelegateByHandlerKey(delegateInvocationMessage.HandlerKey);
 
             // Invoke local delegate with arguments from remote caller
             localDelegate.DynamicInvoke(delegateInvocationMessage.DelegateArguments);
         }
-        
+
         /// <summary>
         /// Processes a RPC result message from server.
         /// </summary>
@@ -559,15 +595,15 @@ namespace CoreRemoting
         /// <exception cref="KeyNotFoundException">Thrown, when the received result is of a unknown call</exception>
         private void ProcessRpcResultMessage(WireMessage message)
         {
-            byte[] sharedSecret = SharedSecret();
+            var sharedSecret = SharedSecret();
 
-            Guid unqiueCallKey = 
+            Guid unqiueCallKey =
                 message.UniqueCallKey == null
-                    ? Guid.Empty 
+                    ? Guid.Empty
                     : new Guid(message.UniqueCallKey);
 
             ClientRpcContext clientRpcContext;
-            
+
             lock (_syncObject)
             {
                 if (_activeCalls == null)
@@ -585,16 +621,27 @@ namespace CoreRemoting
 
             if (message.Error)
             {
-                var remoteException =
-                    Serializer.Deserialize<RemoteInvocationException>(
-                        MessageEncryptionManager.GetDecryptedMessageData(
-                            message: message,
-                            serializer: Serializer,
-                            sharedSecret: sharedSecret,
-                            sendersPublicKeyBlob: _serverPublicKeyBlob,
-                            sendersPublicKeySize: _keyPair?.KeySize ?? 0));
+                try
+                {
+                    var remoteException =
+                        Serializer.Deserialize<Exception>(
+                            MessageEncryptionManager.GetDecryptedMessageData(
+                                message: message,
+                                serializer: Serializer,
+                                sharedSecret: sharedSecret,
+                                sendersPublicKeyBlob: _serverPublicKeyBlob,
+                                sendersPublicKeySize: _keyPair?.KeySize ?? 0));
 
-                clientRpcContext.RemoteException = remoteException;
+                    clientRpcContext.RemoteException = remoteException;
+                }
+                catch (Exception deserializationException)
+                {
+                    var remoteException = new RemoteInvocationException(
+                        "Remote exception couldn't be deserialized",
+                            deserializationException);
+
+                    clientRpcContext.RemoteException = remoteException;
+                }
             }
             else
             {
@@ -607,7 +654,7 @@ namespace CoreRemoting
                             sharedSecret: sharedSecret,
                             sendersPublicKeyBlob: _serverPublicKeyBlob,
                             sendersPublicKeySize: _keyPair?.KeySize ?? 0);
-                    
+
                     var resultMessage =
                         Serializer
                             .Deserialize<MethodCallResultMessage>(rawMessage);
@@ -617,91 +664,89 @@ namespace CoreRemoting
                 catch (Exception e)
                 {
                     clientRpcContext.Error = true;
-                    clientRpcContext.RemoteException = new RemoteInvocationException(
-                        message: e.Message,
-                        innerEx: e.GetType().IsSerializable ? e : null);
+
+                    clientRpcContext.RemoteException =
+                        new RemoteInvocationException(
+                            message: e.Message,
+                            innerEx: e.ToSerializable());
                 }
             }
-            clientRpcContext.WaitHandle.Set();
+
+            clientRpcContext.TaskSource.TrySetResult(null);
         }
-        
+
         #endregion
-        
+
         #region RPC
-        
+
         /// <summary>
         /// Calls a method on a remote service.
         /// </summary>
         /// <param name="methodCallMessage">Details of the remote method to be invoked</param>
         /// <param name="oneWay">Invoke method without waiting for or processing result.</param>
         /// <returns>Results of the remote method invocation</returns>
-        internal Task<ClientRpcContext> InvokeRemoteMethod(MethodCallMessage methodCallMessage, bool oneWay = false)
+        internal async Task<ClientRpcContext> InvokeRemoteMethod(MethodCallMessage methodCallMessage, bool oneWay = false)
         {
-            var sendTask =
-                Task.Run(() =>
+            var sharedSecret = SharedSecret();
+
+            lock (_syncObject)
+            {
+                if (_activeCalls == null)
+                    throw new RemoteInvocationException("ServerDisconnected");
+            }
+
+            var clientRpcContext = new ClientRpcContext();
+
+            lock (_syncObject)
+            {
+                if (_activeCalls.ContainsKey(clientRpcContext.UniqueCallKey))
                 {
-                    byte[] sharedSecret = SharedSecret();
-                    
-                    lock (_syncObject)
-                    {
-                        if (_activeCalls == null)
-                            throw new RemoteInvocationException("ServerDisconnected");                        
-                    }
-                    
-                    var clientRpcContext = new ClientRpcContext();
-                    
-                    lock (_syncObject)
-                    {
-                        if (_activeCalls.ContainsKey(clientRpcContext.UniqueCallKey))
-                        {
-                            clientRpcContext.Dispose();
-                            throw new ApplicationException("Duplicate unique call key.");
-                        }
-                        else
-                        {
-                            _activeCalls.Add(clientRpcContext.UniqueCallKey, clientRpcContext);
-                        }
-                    }
+                    clientRpcContext.Dispose();
+                    throw new ApplicationException("Duplicate unique call key.");
+                }
+                else
+                {
+                    _activeCalls.Add(clientRpcContext.UniqueCallKey, clientRpcContext);
+                }
+            }
 
-                    var wireMessage =
-                        MessageEncryptionManager.CreateWireMessage(
-                            messageType: "rpc",
-                            serializer: Serializer,
-                            serializedMessage: Serializer.Serialize(methodCallMessage),
-                            sharedSecret: sharedSecret,
-                            keyPair: _keyPair,
-                            uniqueCallKey: clientRpcContext.UniqueCallKey.ToByteArray());
+            var wireMessage =
+                MessageEncryptionManager.CreateWireMessage(
+                    messageType: "rpc",
+                    serializer: Serializer,
+                    serializedMessage: Serializer.Serialize(methodCallMessage),
+                    sharedSecret: sharedSecret,
+                    keyPair: _keyPair,
+                    uniqueCallKey: clientRpcContext.UniqueCallKey.ToByteArray());
 
-                    byte[] rawData = Serializer.Serialize(wireMessage);
+            var rawData = Serializer.Serialize(wireMessage);
 
-                    _rawMessageTransport.LastException = null;
+            _rawMessageTransport.LastException = null;
 
-                    _rawMessageTransport.SendMessage(rawData);
+            await _rawMessageTransport.SendMessageAsync(rawData)
+                .ConfigureAwait(false);
 
-                    if (_rawMessageTransport.LastException != null)
-                    {
-                        clientRpcContext.Dispose();
-                        throw _rawMessageTransport.LastException;
-                    }
+            if (_rawMessageTransport.LastException != null)
+            {
+                clientRpcContext.Dispose();
+                throw _rawMessageTransport.LastException;
+            }
 
-                    if (oneWay || clientRpcContext.ResultMessage != null) 
-                        return clientRpcContext;
-                
-                    if (_config.InvocationTimeout <= 0)
-                        clientRpcContext.WaitHandle.WaitOne();
-                    else
-                        clientRpcContext.WaitHandle.WaitOne(_config.InvocationTimeout * 1000);
+            if (oneWay || clientRpcContext.ResultMessage != null)
+                return clientRpcContext;
 
-                    return clientRpcContext;
-                });
-            
-            return sendTask;
+            await clientRpcContext.Task.Timeout(
+                _config.InvocationTimeout,
+                $"Invocation timeout ({_config.InvocationTimeout}) exceeded.")
+                .ConfigureAwait(false);
+
+            return clientRpcContext;
         }
-        
+
         #endregion
-        
+
         #region Proxy management
-        
+
         /// <summary>
         /// Creates a proxy object to provide access to a remote service.
         /// </summary>
@@ -727,7 +772,7 @@ namespace CoreRemoting
         {
             var serviceProxyType = typeof(ServiceProxy<>).MakeGenericType(serviceInterfaceType);
             var serviceProxy = Activator.CreateInstance(serviceProxyType, this, serviceName);
-            
+
             return ProxyGenerator.CreateInterfaceProxyWithoutTarget(
                 interfaceToProxy: serviceInterfaceType,
                 interceptor: (IInterceptor)serviceProxy);
@@ -752,16 +797,16 @@ namespace CoreRemoting
         {
             if (!ProxyUtil.IsProxy(serviceProxy))
                 return;
-            
+
             var proxyType = serviceProxy.GetType();
-            
-            var hiddenInterceptorsField = 
-                proxyType.GetField("__interceptors", 
+
+            var hiddenInterceptorsField =
+                proxyType.GetField("__interceptors",
                     BindingFlags.Instance | BindingFlags.NonPublic);
 
             if (hiddenInterceptorsField == null)
                 return;
-            
+
             var interceptors =  hiddenInterceptorsField.GetValue(serviceProxy) as IInterceptor[];
 
             var coreRemotingInterceptor =
@@ -773,9 +818,9 @@ namespace CoreRemoting
         }
 
         #endregion
-        
+
         #region IDisposable implementation
-        
+
         /// <summary>
         /// Frees managed resources.
         /// </summary>
@@ -785,9 +830,9 @@ namespace CoreRemoting
                 RemotingClient.DefaultRemotingClient = null;
 
             _clientInstances.TryRemove(_config.UniqueClientInstanceName, out _);
-            
+
             Disconnect();
-            
+
             _cancellationTokenSource.Cancel();
             _cancellationTokenSource.Dispose();
             _delegateRegistry.Clear();
@@ -807,29 +852,11 @@ namespace CoreRemoting
                 }
             }
 
-            if (_handshakeCompletedWaitHandle != null)
-            {
-                _handshakeCompletedWaitHandle.Dispose();
-                _handshakeCompletedWaitHandle = null;
-            }
-
-            if (_authenticationCompletedWaitHandle != null)
-            {
-                _authenticationCompletedWaitHandle.Dispose();
-                _authenticationCompletedWaitHandle = null;
-            }
-
-            if (_goodbyeCompletedWaitHandle != null)
-            {
-                _goodbyeCompletedWaitHandle.Dispose();
-                _goodbyeCompletedWaitHandle = null;
-            }
-
             _keyPair?.Dispose();
         }
-        
+
         #endregion
-        
+
         #region Managing client instances
 
         /// <summary>
@@ -865,13 +892,13 @@ namespace CoreRemoting
             }
             internal set
             {
-                _defaultRemotingClientRef = 
-                    value == null 
-                        ? null 
+                _defaultRemotingClientRef =
+                    value == null
+                        ? null
                         : new WeakReference<IRemotingClient>(value);
             }
         }
-        
+
         #endregion
     }
 }

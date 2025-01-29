@@ -1,183 +1,116 @@
 using System;
-using System.Net.Sockets;
-using System.Reflection;
-using WebSocketSharp;
-using WebSocketSharp.Net;
+using System.Net;
+using System.Net.WebSockets;
+using System.Threading;
+using System.Threading.Tasks;
+using CoreRemoting.Toolbox;
 
-namespace CoreRemoting.Channels.Websocket
+namespace CoreRemoting.Channels.Websocket;
+
+/// <summary>
+/// Client side websocket channel implementation based on System.Net.Websockets.
+/// </summary>
+public class WebsocketClientChannel : WebSocketTransport, IClientChannel
 {
     /// <summary>
-    /// Client side websocket channel implementation.
+    /// Gets or sets the URL this channel is connected to.
     /// </summary>
-    public class WebsocketClientChannel : IClientChannel, IRawMessageTransport
+    public string Url { get; private set; }
+
+    private Uri Uri { get; set; }
+
+    /// <inheritdoc />
+    public bool IsConnected { get; private set; }
+
+    /// <inheritdoc />
+    public IRawMessageTransport RawMessageTransport => this;
+
+    private ClientWebSocket ClientWebSocket { get; set; }
+
+    /// <inheritdoc />
+    protected override WebSocket WebSocket => ClientWebSocket;
+
+    /// <inheritdoc />
+    public void Init(IRemotingClient client)
     {
-        private WebSocket _webSocket;
-        
-        /// <summary>
-        /// Event: Fires when a message is received from server.
-        /// </summary>
-        public event Action<byte[]> ReceiveMessage;
-        
-        /// <summary>
-        /// Event: Fires when an error is occurred.
-        /// </summary>
-        public event Action<string, Exception> ErrorOccured;
+        Url =
+            "ws://" +
+            client.Config.ServerHostName + ":" +
+            Convert.ToString(client.Config.ServerPort) +
+            "/rpc";
 
-        /// <inheritdoc />
-        public event Action Disconnected;
+        Uri = new Uri(Url);
 
-        /// <summary>
-        /// Initializes the channel.
-        /// </summary>
-        /// <param name="client">CoreRemoting client</param>
-        public void Init(IRemotingClient client)
+        // note: Nagle is disabled by default on NetCore, see
+        // https://github.com/dotnet/runtime/discussions/81175
+        ClientWebSocket = new ClientWebSocket();
+        ClientWebSocket.Options.Cookies = new CookieContainer();
+        ClientWebSocket.Options.Cookies.Add(new Cookie(
+            name: MessageEncryptionCookie,
+            value: client.MessageEncryption ? "1" : "0",
+            path: Uri.LocalPath,
+            domain: Uri.Host));
+
+        if (client.MessageEncryption)
         {
-            string url = 
-                "ws://" + 
-                client.Config.ServerHostName + ":" + 
-                Convert.ToString(client.Config.ServerPort) + 
-                "/rpc";
-            
-            _webSocket = new WebSocket(url);
+            ClientWebSocket.Options.Cookies.Add(new Cookie(
+                name: ClientPublicKeyCookie,
+                value: Convert.ToBase64String(client.PublicKey),
+                path: Uri.LocalPath,
+                domain: Uri.Host));
+        }
+    }
 
-            TryToSetNoDelayFlagOnUnderlyingTcpClient();
-            
-            _webSocket.SetCookie(new Cookie(
-                name: "MessageEncryption",
-                value: client.MessageEncryption ? "1" : "0"));
+    /// <inheritdoc />
+    public async Task ConnectAsync()
+    {
+        await ClientWebSocket.ConnectAsync(
+            new Uri(Url), CancellationToken.None)
+                .ConfigureAwait(false);
 
-            if (client.MessageEncryption)
-            {
-                _webSocket.SetCookie(new Cookie(
-                    "ShakeHands",
-                    Convert.ToBase64String(client.PublicKey)));
-            }
+        IsConnected = true;
+        OnConnected();
 
-            _webSocket.Log.Output = (timestamp, text) => Console.WriteLine("{0}: {1}", timestamp, text);
-            _webSocket.Log.Level = LogLevel.Debug;
+        await WebSocket.SendAsync(EmptyMessage, 
+            WebSocketMessageType.Binary, true, CancellationToken.None)
+                .ConfigureAwait(false);
+
+        StartListening();
+    }
+
+    /// <inheritdoc />
+    public async Task DisconnectAsync()
+    {
+        if (!IsConnected)
+            return;
+
+        IsConnected = false;
+
+        try
+        {
+            await ClientWebSocket.CloseAsync(
+                WebSocketCloseStatus.NormalClosure, "Ok", CancellationToken.None)
+                    .ConfigureAwait(false);
+        }
+        catch // (ObjectDisposedException)
+        {
+            // web socket already closed?
         }
 
-        /// <summary>
-        /// Try to set NoDelay flag on the underlying TcpClient to enhance performance on Linux.
-        /// </summary>
-        private void TryToSetNoDelayFlagOnUnderlyingTcpClient()
-        {
-            var webSocketType = _webSocket.GetType();
-            var tcpClientPrivateField =
-                webSocketType.GetField(
-                    name: "_tcpClient",
-                    bindingAttr: BindingFlags.NonPublic | BindingFlags.GetField);
+        OnDisconnected();
+    }
 
-            if (tcpClientPrivateField != null)
-            {
-                if (tcpClientPrivateField.GetValue(_webSocket) is TcpClient tcpClient)
-                    tcpClient.NoDelay = true;
-            }
-        }
-        
-        /// <summary>
-        /// Establish a websocket connection with the server.
-        /// </summary>
-        public void Connect()
-        {
-            if (_webSocket == null)
-                throw new InvalidOperationException("Channel is not initialized.");
-            
-            if (_webSocket.IsAlive)
-                return;
+    /// <inheritdoc />
+    public void Dispose()
+    {
+        if (ClientWebSocket == null)
+            return;
 
-            LastException = null;
-            
-            _webSocket.OnMessage += OnMessage;
-            _webSocket.OnError += OnError;
-            _webSocket.OnClose += OnDisconnected;
+        if (IsConnected)
+            DisconnectAsync()
+                .JustWait();
 
-            _webSocket.Connect();
-            _webSocket.Send(string.Empty);
-        }
-
-        private void OnDisconnected(object o, CloseEventArgs closeEventArgs)
-        {
-            Disconnected?.Invoke();
-        }
-
-        /// <summary>
-        /// Event procedure: Called when a error occurs on the websocket layer.
-        /// </summary>
-        /// <param name="sender">Event sender</param>
-        /// <param name="e">Event arguments</param>
-        private void OnError(object sender, ErrorEventArgs e)
-        {
-            LastException = new NetworkException(e.Message, e.Exception);
-            
-            ErrorOccured?.Invoke(e.Message, e.Exception);
-        }
-
-        /// <summary>
-        /// Closes the websocket connection.
-        /// </summary>
-        public void Disconnect()
-        {
-            if (_webSocket == null)
-                return;
-            
-            _webSocket.OnMessage -= OnMessage;
-            _webSocket.OnError -= OnError;
-            
-            _webSocket.Close(CloseStatusCode.Normal);
-        }
-
-        /// <summary>
-        /// Gets whether the websocket connection is established or not.
-        /// </summary>
-        public bool IsConnected
-        {
-            get
-            {
-                if (_webSocket == null)
-                    throw new InvalidOperationException("Channel is not initialized.");
-
-                return _webSocket.IsAlive;
-            }
-        }
-
-        /// <summary>
-        /// Gets the raw message transport component for this connection.
-        /// </summary>
-        public IRawMessageTransport RawMessageTransport => this;
-        
-        /// <summary>
-        /// Disconnect and free manages resources.
-        /// </summary>
-        public void Dispose()
-        {
-            Disconnect();
-            _webSocket = null;
-        }
-
-        /// <summary>
-        /// Event procedure: Called when a message from server is received.
-        /// </summary>
-        /// <param name="sender">Sender of the event</param>
-        /// <param name="e">Event arguments containing the message content</param>
-        private void OnMessage(object sender, MessageEventArgs e)
-        {
-            ReceiveMessage?.Invoke(e.RawData);
-        }
-        
-        /// <summary>
-        /// Sends a message to the server.
-        /// </summary>
-        /// <param name="rawMessage">Raw message data</param>
-        public bool SendMessage(byte[] rawMessage)
-        {
-            _webSocket.Send(rawMessage);
-            return true;
-        }
-
-        /// <summary>
-        /// Gets or sets the last exception.
-        /// </summary>
-        public NetworkException LastException { get; set; }
+        ClientWebSocket.Dispose();
+        ClientWebSocket = null;
     }
 }

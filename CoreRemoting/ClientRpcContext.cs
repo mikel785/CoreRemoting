@@ -1,5 +1,5 @@
 using System;
-using System.Threading;
+using System.Threading.Tasks;
 using CoreRemoting.RpcMessaging;
 
 namespace CoreRemoting
@@ -15,19 +15,20 @@ namespace CoreRemoting
         internal ClientRpcContext()
         {
             UniqueCallKey = Guid.NewGuid();
-            WaitHandle = new EventWaitHandle(initialState: false, EventResetMode.ManualReset);
+            TaskSource = new TaskCompletionSource<object>();
+            Task = TaskSource.Task;
         }
-        
+
         /// <summary>
         /// Gets the unique key of RPC call.
         /// </summary>
         public Guid UniqueCallKey { get; }
-        
+
         /// <summary>
         /// Gets or sets the result message, that was received from server after the call was invoked on server side.
         /// </summary>
         public MethodCallResultMessage ResultMessage { get; set; }
-        
+
         /// <summary>
         /// Gets or sets whether this RPC call is in error state.
         /// </summary>
@@ -36,19 +37,24 @@ namespace CoreRemoting
         /// <summary>
         /// Gets or sets an exception that describes an error that occurred on server side RPC invocation.
         /// </summary>
-        public RemoteInvocationException RemoteException { get; set; }
-        
+        public Exception RemoteException { get; set; }
+
         /// <summary>
-        /// Gets a wait handle that is set, when the response of this RPC call is received from server.
+        /// Task completion source for this RPC call result.
         /// </summary>
-        public EventWaitHandle WaitHandle { get; }
-        
+        public TaskCompletionSource<object> TaskSource { get; }
+
+        /// <summary>
+        /// Gets a task containing the response of this RPC call received from server.
+        /// </summary>
+        public Task Task { get; }
+
         /// <summary>
         /// Frees managed resources.
         /// </summary>
         public void Dispose()
         {
-            WaitHandle?.Dispose();
+            Task?.Dispose();
         }
     }
 }
